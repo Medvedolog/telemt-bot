@@ -18,7 +18,7 @@ CONF=telemt
 start_service() {
     # Guard: UCI config must exist
     if [ ! -f "/etc/config/$CONF" ]; then
-        logger -t telemt-bot "Error: /etc/config/$CONF not found. Run: uci set telemt.general=telemt && uci commit telemt"
+        logger -t telemt-bot "Error: /etc/config/$CONF not found."
         return 1
     fi
 
@@ -36,7 +36,7 @@ start_service() {
     config_get chat_id general bot_chat_id ""
 
     [ -n "$token" ] && [ -n "$chat_id" ] || {
-        logger -t telemt-bot "Error: bot_token or bot_chat_id not configured. Not starting."
+        logger -t telemt-bot "Error: bot_token or bot_chat_id not configured."
         return 1
     }
 
@@ -45,15 +45,25 @@ start_service() {
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 0
     procd_set_param stderr 1
-    procd_set_param pidfile /var/run/telemt-bot.pid
     procd_set_param file /etc/config/telemt
     procd_close_instance
 
-    logger -t telemt-bot "Service started (token=***${token#????????}, chat_id=${chat_id})."
+    logger -t telemt-bot "Service started (chat_id=${chat_id})."
 }
 
 stop_service() {
     logger -t telemt-bot "Service stopping..."
+    # Kill orphaned children (curl, wget, sleep) from long-polling loop.
+    # The bot script runs as /bin/sh, spawning curl/uclient-fetch subprocesses
+    # that survive procd SIGTERM because ash defers signals during child wait.
+    local p
+    for p in $(pgrep -f "$PROG" 2>/dev/null); do
+        kill -TERM "$p" 2>/dev/null
+    done
+    sleep 2
+    for p in $(pgrep -f "$PROG" 2>/dev/null); do
+        kill -KILL "$p" 2>/dev/null
+    done
     rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock
 }
 

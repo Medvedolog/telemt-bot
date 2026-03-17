@@ -12,7 +12,7 @@
 # ==============================================================================
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="3.3.20"
+BOT_VERSION="3.3.21"
 
 # ──────────────────────────────────────────────
 # 0. UCI Config & Auth
@@ -60,6 +60,8 @@ E_DEL="\ud83d\uddd1\ufe0f"; E_CAL="\ud83d\udcc5"; E_KEY="\ud83d\udd11"; E_RGN="\
 E_PRF="\ud83d\udc64"; E_WARN="\u26a0\ufe0f"; E_EDIT="\u270f\ufe0f"; E_LINK="\ud83d\udd17"
 E_CPU="\u2699\ufe0f"; E_RAM="\ud83d\udcbe"; E_TRAF="\ud83d\udcc8"; E_VER="\ud83d\udce6"
 E_OS="\ud83d\udc27"; E_NET="\ud83d\udd17"
+E_SCAN="\ud83d\udd0d"; E_PORT="\ud83d\udecf\ufe0f"; E_WGT="\u2696\ufe0f"
+E_OFF="\u26aa"; E_PATH="\ud83d\udee3\ufe0f"; E_EXIT="\ud83d\udeaa"
 
 # ==============================================================================
 # 1. NETWORK LAYER — 3-TIER FAILOVER
@@ -71,14 +73,42 @@ WAN_IP_FILE="/tmp/telemt_bot_wan_ip"
 
 refresh_wan_ip() {
     local ip=""
-    ip=$(uclient-fetch -q -O - --timeout=2 "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
-    [ -z "$ip" ] && ip=$(uclient-fetch -q -O - --timeout=2 "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
-    if [ -n "$ip" ]; then
-        CACHED_WAN_IP="$ip"
-        echo "$ip" > "$WAN_IP_FILE"
-    elif [ -f "$WAN_IP_FILE" ]; then
-        CACHED_WAN_IP=$(cat "$WAN_IP_FILE" 2>/dev/null)
+    # Tier 1: via SOCKS (router may have no direct internet)
+    if [ -n "$CACHED_PROXY" ] && command -v curl >/dev/null 2>&1; then
+        ip=$(curl -s -k --connect-timeout 3 --max-time 5 -x "$CACHED_PROXY" \
+            "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
+        [ -z "$ip" ] && ip=$(curl -s -k --connect-timeout 3 --max-time 5 -x "$CACHED_PROXY" \
+            "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
     fi
+    # Tier 2: direct
+    [ -z "$ip" ] && ip=$(uclient-fetch -q -O - --timeout=3 "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
+    [ -z "$ip" ] && ip=$(uclient-fetch -q -O - --timeout=3 "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
+    if [ -n "$ip" ]; then
+        echo "$ip" > "$WAN_IP_FILE"
+    fi
+}
+
+# Read WAN IP from cache file (background refresh writes there)
+get_wan_ip() {
+    [ -f "$WAN_IP_FILE" ] && cat "$WAN_IP_FILE" 2>/dev/null | tr -d ' \n' || echo ""
+}
+
+# Compute egress type from UCI upstream config
+get_egress_type() {
+    local _t _en etype="Direct"
+    for _u in $(uci show telemt 2>/dev/null | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+        _en=$(uci -q get "telemt.${_u}.enabled")
+        [ "$_en" = "0" ] && continue
+        _t=$(uci -q get "telemt.${_u}.type")
+        case "$_t" in socks5) etype="SOCKS5" ;; socks4) etype="SOCKS4" ;; esac
+    done
+    echo "$etype"
+}
+
+# Compute TG Path from UCI
+get_tg_path() {
+    local mp=$(uci -q get telemt.general.use_middle_proxy)
+    [ "$mp" = "1" ] && echo "ME" || echo "Direct-DC"
 }
 
 # ─── 0e. Version cache (read from init.d cache files — never exec telemt binary) ───
@@ -499,6 +529,22 @@ handle_command() {
                         send_message "${E_OK} Upstream address updated! (Press Apply)"
                     else send_message "${E_ERR} Invalid format! Must be IP:PORT."; fi
                     handle_command "up_manage_${tgt}"; return ;;
+                upweight)
+                    local w=$(echo "$cmd" | tr -d ' \r\n\t')
+                    if echo "$w" | grep -qE '^[0-9]+$' && [ "$w" -gt 0 ] 2>/dev/null; then
+                        uci_safe set "telemt.${tgt}.weight=${w}"; uci_safe_commit
+                        send_message "${E_OK} Weight set to ${w}!"
+                    else send_message "${E_ERR} Invalid weight! Enter a positive number."; fi
+                    handle_command "up_manage_${tgt}"; return ;;
+                upalias)
+                    local al=$(echo "$cmd" | tr -d '\r\n\t' | cut -c1-30)
+                    if [ "$al" = "." ] || [ -z "$al" ]; then
+                        uci_safe delete "telemt.${tgt}.alias" 2>/dev/null
+                        send_message "${E_OK} Name cleared."
+                    else
+                        uci_safe set "telemt.${tgt}.alias=${al}"; send_message "${E_OK} Name set: ${al}"
+                    fi
+                    uci_safe_commit; handle_command "up_manage_${tgt}"; return ;;
             esac
         fi
     fi
@@ -509,7 +555,7 @@ handle_command() {
     "/start"|"/menu")
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}]]}"
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-        send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Route: <b>${LAST_ROUTE}</b>\nSelect an action:" "$kb"
+        send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Egress: <b>$(get_egress_type)</b> | TG: <b>$(get_tg_path)</b>\nSelect an action:" "$kb"
         ;;
 
     # ── System status (fast path — uses cached WAN IP and versions) ──
@@ -534,7 +580,7 @@ handle_command() {
         [ -n "$proxy_str" ] && proxy_info="SOCKS (${proxy_str})"
 
         # Use cached WAN IP (refreshed in background by health daemon)
-        local wan_ip="$CACHED_WAN_IP"; [ -z "$wan_ip" ] && wan_ip="Detecting..."
+        local wan_ip="$(get_wan_ip)"; [ -z "$wan_ip" ] && wan_ip="Detecting..."
 
         local lan_ip=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')
         local ts_ip=$(ip -4 addr show tailscale0 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')
@@ -554,18 +600,20 @@ handle_command() {
             local proc_ram=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$pid/status 2>/dev/null)
             [ -z "$proc_ram" ] && proc_ram="0"
 
-            # Fast local fetch with 1s timeout — if proxy is slow, skip gracefully
             local r_live=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_METRICS_PORT}/metrics" 2>/dev/null)
             local acc_stats=$(cat /tmp/telemt_stats.txt 2>/dev/null)
 
             local awk_script='
-                BEGIN { tx_live=0; rx_live=0; act=0; dp=0; tx_acc=0; rx_acc=0; upt=0 }
+                BEGIN { tx_live=0; rx_live=0; act=0; dp=0; rej=0; tx_acc=0; rx_acc=0; upt=0; up_ok=0; up_fail=0 }
                 /^LIVE_MARKER/ { mode=1; next }
                 /^ACC_MARKER/ { mode=2; next }
                 /telemt_user_octets_to_client/ { if(mode==1) tx_live+=$2 }
                 /telemt_user_octets_from_client/ { if(mode==1) rx_live+=$2 }
                 /telemt_user_connections_current/ { if(mode==1 && ($2+0)>0) act++ }
                 /telemt_desync_total/ { if(mode==1) dp=$2 }
+                /telemt_connections_bad_total/ { if(mode==1) rej=$2 }
+                /telemt_upstream_connect_success_total/ { if(mode==1) up_ok=$2 }
+                /telemt_upstream_connect_fail_total/ { if(mode==1) up_fail=$2 }
                 /telemt_uptime_seconds/ { if(mode==1) upt=$2 }
                 { if (mode==2 && NF==3 && !match($0, /^telemt/)) { tx_acc+=$2; rx_acc+=$3 } }
                 END {
@@ -573,7 +621,7 @@ handle_command() {
                     if(tot_tx_m > 1024) { tx_s = sprintf("%.2f GB", tot_tx_m/1024) } else { tx_s = sprintf("%.2f MB", tot_tx_m) }
                     if(tot_rx_m > 1024) { rx_s = sprintf("%.2f GB", tot_rx_m/1024) } else { rx_s = sprintf("%.2f MB", tot_rx_m) }
                     upt_d = int(upt/86400); upt_h = int((upt%86400)/3600); upt_m = int((upt%3600)/60);
-                    printf "%s|%s|%d|%d|%dd %dh %dm", tx_s, rx_s, act, dp, upt_d, upt_h, upt_m
+                    printf "%s|%s|%d|%d|%dd %dh %dm|%d|%d|%d", tx_s, rx_s, act, dp, upt_d, upt_h, upt_m, rej, up_ok, up_fail
                 }'
             local parsed=$(printf "LIVE_MARKER\n%s\nACC_MARKER\n%s" "${r_live}" "${acc_stats}" | awk "$awk_script")
 
@@ -582,12 +630,48 @@ handle_command() {
             local s_act=$(echo "$parsed"|cut -d'|' -f3)
             local s_dpi=$(echo "$parsed"|cut -d'|' -f4)
             local s_upt=$(echo "$parsed"|cut -d'|' -f5)
+            local s_rej=$(echo "$parsed"|cut -d'|' -f6)
+            local s_upok=$(echo "$parsed"|cut -d'|' -f7)
+            local s_upfail=$(echo "$parsed"|cut -d'|' -f8)
 
             local total_cfg_u=$(uci show telemt | grep -c '=user')
             local frozen_u=$(uci show telemt | grep '\.disabled=' | grep -iE '1|on|true' | wc -l)
             local active_u=$((total_cfg_u - frozen_u))
 
-            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}\n\n${E_CPU} <b>CPU Load (1/5/15m):</b> ${loadavg}\n${E_RAM} <b>RAM (Free / Telemt):</b> ${free_ram} MB / ${proc_ram} MB\n\n${E_TRAF} <b>Total Traffic:</b>\n${E_DWN} DL: ${s_dl_tot} | ${E_UP} UL: ${s_ul_tot}\n${E_USR} <b>Users Online:</b> ${s_act} / ${active_u} active\n${E_SHLD} <b>DPI Probes:</b> ${s_dpi}"
+            # Compute TG Path and Egress from UCI
+            local uci_mp=$(uci -q get telemt.general.use_middle_proxy)
+            local tg_path="Direct-DC"
+            [ "$uci_mp" = "1" ] && tg_path="ME"
+
+            local egress_type="Direct"
+            local up_total=0 up_healthy=0
+            for _u in $(uci show telemt 2>/dev/null | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+                local _en=$(uci -q get "telemt.${_u}.enabled")
+                [ "$_en" = "0" ] && continue
+                up_total=$((up_total + 1))
+                local _t=$(uci -q get "telemt.${_u}.type")
+                case "$_t" in socks5) egress_type="SOCKS5" ;; socks4) egress_type="SOCKS4" ;; esac
+                up_healthy=$((up_healthy + 1))
+            done
+            [ "$up_total" -eq 0 ] && egress_type="Direct"
+
+            # Port status
+            local proxy_port=$(uci -q get telemt.general.port || echo "8443")
+            local port_open="closed"
+            if iptables-save 2>/dev/null | grep -qiE "dport.*${proxy_port}.*accept" || \
+               nft list ruleset 2>/dev/null | grep -qiE "dport.*${proxy_port}.*accept"; then
+                port_open="open"
+            fi
+            local port_icon="${E_ERR}"; [ "$port_open" = "open" ] && port_icon="${E_OK}"
+
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}"
+            stat_out="${stat_out}\n${E_PATH} <b>TG Path:</b> ${tg_path} | <b>Egress:</b> ${egress_type}"
+            [ "$up_total" -gt 0 ] && stat_out="${stat_out}\n${E_GLOB} <b>Upstream:</b> ${up_healthy}/${up_total} (ok: ${s_upok}, fail: ${s_upfail})"
+            stat_out="${stat_out}\n${E_PORT} <b>Port:</b> ${proxy_port} (${port_open})"
+            stat_out="${stat_out}\n\n${E_CPU} <b>CPU Load (1/5/15m):</b> ${loadavg}\n${E_RAM} <b>RAM (Free / Telemt):</b> ${free_ram} MB / ${proc_ram} MB"
+            stat_out="${stat_out}\n\n${E_TRAF} <b>Total Traffic:</b>\n${E_DWN} DL: ${s_dl_tot} | ${E_UP} UL: ${s_ul_tot}"
+            stat_out="${stat_out}\n${E_USR} <b>Users Online:</b> ${s_act} / ${active_u} active"
+            stat_out="${stat_out}\n${E_SCAN} <b>DPI Tamper:</b> ${s_dpi} | <b>Rejected:</b> ${s_rej}"
         else
             stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> 0d 0h 0m"
         fi
@@ -627,28 +711,87 @@ handle_command() {
 
     # ── Users list ──
     "cmd_users"|"/users")
-        local u_list="${E_USR} <b>Configured Users:</b>\n\n"
-        local kb_buttons="" is_first=1
+        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+        # Fetch live per-user stats from API (zero-cost, localhost)
+        local api_raw=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/users" 2>/dev/null)
+        # Build lookup: username -> conns|ips|octets
+        local user_live_file=$(mktemp /tmp/tbot_users.XXXXXX)
+        if [ -n "$api_raw" ]; then
+            echo "$api_raw" | awk -F'"' '
+            /"username":/ { u=$4 }
+            /"current_connections":/ { match($0, /[0-9]+/); c=substr($0, RSTART, RLENGTH) }
+            /"active_unique_ips":/ { match($0, /[0-9]+/); ip=substr($0, RSTART, RLENGTH) }
+            /"total_octets":/ { match($0, /[0-9]+/); o=substr($0, RSTART, RLENGTH); if(u) print u"|"c"|"ip"|"o; u="" }
+            ' > "$user_live_file"
+        fi
+
+        local u_online="" u_offline="" u_frozen=""
+        local kb_on="" kb_off="" kb_frz=""
+        local n_on=0 n_off=0 n_frz=0
+
         for user in $(uci show telemt | grep '=user' | cut -d. -f2 | cut -d= -f1); do
-            local quota=$(uci -q get "telemt.${user}.data_quota" | tr -d '"')
-            local q_str="${E_INF}"; [ -n "$quota" ] && [ "$quota" != "unlimited" ] && q_str="${quota} GB"
-            local exp_date=$(uci -q get "telemt.${user}.expire_date" | tr -d '"')
-            local status_icon="${E_OK}"
-            if [ -n "$exp_date" ] && [ "$exp_date" != "unlimited" ]; then
-                local exp_epoch=$(date -d "$(echo "$exp_date" | awk -F'[. :]' 'NF==5 {printf "%04d-%02d-%02d %02d:%02d:00", $3,$2,$1,$4,$5}')" +%s 2>/dev/null)
-                local now_epoch=$(date +%s)
-                [ -n "$exp_epoch" ] && [ "$now_epoch" -ge "$exp_epoch" ] && status_icon="${E_ERR}"
+            local disabled=$(uci -q get "telemt.${user}.enabled")
+            [ "$disabled" = "0" ] && {
+                n_frz=$((n_frz + 1))
+                u_frozen="${u_frozen}${E_FRZ} <b>${user}</b> [paused]\n"
+                kb_frz="${kb_frz}{\"text\":\"${E_FRZ} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
+                continue
+            }
+
+            local conns=0 ips=0 octets=0
+            if [ -f "$user_live_file" ]; then
+                local line=$(grep "^${user}|" "$user_live_file")
+                if [ -n "$line" ]; then
+                    conns=$(echo "$line" | cut -d'|' -f2)
+                    ips=$(echo "$line" | cut -d'|' -f3)
+                    octets=$(echo "$line" | cut -d'|' -f4)
+                fi
             fi
-            local disabled=$(uci -q get "telemt.${user}.disabled" | awk '{print tolower($1)}')
-            if [ "$disabled" = "1" ] || [ "$disabled" = "true" ] || [ "$disabled" = "on" ]; then status_icon="${E_FRZ}"; fi
-            u_list="${u_list}${status_icon} <b>${user}</b> (Quota: ${q_str})\n"
-            [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
-            kb_buttons="${kb_buttons}[{\"text\":\"${E_SET} ${user}\",\"callback_data\":\"user_manage_${user}\"}]"
+            local traf_mb=$(awk "BEGIN { m=$octets/1048576; if(m>1024) printf \"%.1f GB\",m/1024; else printf \"%.0f MB\",m }")
+            local ip_str=""; [ "$ips" -gt 0 ] 2>/dev/null && ip_str=", ${ips} IP"
+
+            if [ "$conns" -gt 0 ] 2>/dev/null; then
+                n_on=$((n_on + 1))
+                u_online="${u_online}${E_OK} <b>${user}</b> (${conns} conn${ip_str}) | ${traf_mb}\n"
+                kb_on="${kb_on}{\"text\":\"${E_OK} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
+            else
+                n_off=$((n_off + 1))
+                u_offline="${u_offline}${E_OFF} ${user} | ${traf_mb}\n"
+                kb_off="${kb_off}{\"text\":\"${E_OFF} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
+            fi
         done
-        [ "$(uci show telemt | grep -c '=user')" -eq 0 ] && u_list="No users configured."
-        local kb="{\"inline_keyboard\":[${kb_buttons}"
-        [ "$is_first" = "0" ] && kb="${kb},"
-        kb="${kb}[{\"text\":\"${E_ADD} Add User\",\"callback_data\":\"cmd_add_user\"},{\"text\":\"${E_CSV} Get CSV\",\"callback_data\":\"cmd_get_csv\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rm -f "$user_live_file"
+
+        local total=$((n_on + n_off + n_frz))
+        local u_list="${E_USR} <b>Users (${n_on} online / ${total} total):</b>\n\n"
+        [ -n "$u_online" ] && u_list="${u_list}${u_online}\n"
+        [ -n "$u_offline" ] && u_list="${u_list}${u_offline}\n"
+        [ -n "$u_frozen" ] && u_list="${u_list}${u_frozen}"
+        [ "$total" -eq 0 ] && u_list="${E_USR} No users configured."
+
+        # Build keyboard: 2 buttons per row (online first, then offline, then frozen)
+        local all_btns="${kb_on}${kb_off}${kb_frz}"
+        all_btns=$(echo "$all_btns" | sed 's/,$//')
+        local kb_rows="" btn_buf="" btn_count=0
+        local IFS_OLD="$IFS"; IFS=","
+        for btn in $all_btns; do
+            btn_count=$((btn_count + 1))
+            btn_buf="${btn_buf}${btn},"
+            if [ "$btn_count" -ge 2 ]; then
+                btn_buf=$(echo "$btn_buf" | sed 's/,$//')
+                [ -n "$kb_rows" ] && kb_rows="${kb_rows},"
+                kb_rows="${kb_rows}[${btn_buf}]"
+                btn_buf="" btn_count=0
+            fi
+        done
+        IFS="$IFS_OLD"
+        if [ -n "$btn_buf" ]; then
+            btn_buf=$(echo "$btn_buf" | sed 's/,$//')
+            [ -n "$kb_rows" ] && kb_rows="${kb_rows},"
+            kb_rows="${kb_rows}[${btn_buf}]"
+        fi
+        [ -n "$kb_rows" ] && kb_rows="${kb_rows},"
+        local kb="{\"inline_keyboard\":[${kb_rows}[{\"text\":\"${E_ADD} Add User\",\"callback_data\":\"cmd_add_user\"},{\"text\":\"${E_CSV} Get CSV\",\"callback_data\":\"cmd_get_csv\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         send_message "$u_list" "$kb"
         ;;
 
@@ -675,14 +818,21 @@ handle_command() {
             ups_found=$((ups_found + 1))
             local type=$(uci -q get "telemt.${up}.type" || echo "direct")
             local addr=$(uci -q get "telemt.${up}.address" | tr -d '"' || echo "-")
+            local alias=$(uci -q get "telemt.${up}.alias" | tr -d '"')
+            local weight=$(uci -q get "telemt.${up}.weight" || echo "10")
             local en=$(uci -q get "telemt.${up}.enabled" | awk '{print tolower($1)}'); [ -z "$en" ] && en="1"
             local icon="${E_OK}"
-            [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ] && icon="${E_ERR}"
-            up_list="${up_list}${icon} <b>#${ups_found}:</b> ${type}\n<code>${addr}</code>\n\n"
+            [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ] && icon="${E_FRZ}"
+            local label="${type}"
+            [ -n "$alias" ] && label="${alias} (${type})"
+            [ "$type" = "direct" ] && addr="local"
+            up_list="${up_list}${icon} <b>#${ups_found}:</b> ${label}\n<code>${addr}</code> w:${weight}\n\n"
             [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
-            kb_buttons="${kb_buttons}[{\"text\":\"${E_SET} ${type} (${addr})\",\"callback_data\":\"up_manage_${up}\"}]"
+            local btn_label="${type}"
+            [ -n "$alias" ] && btn_label="${alias}"
+            kb_buttons="${kb_buttons}[{\"text\":\"${E_SET} ${btn_label}\",\"callback_data\":\"up_manage_${up}\"}]"
         done
-        [ "$ups_found" -eq 0 ] && up_list="No upstreams configured."
+        [ "$ups_found" -eq 0 ] && up_list="${E_GLOB} No upstreams configured. Telemt uses Direct."
         local kb="{\"inline_keyboard\":[${kb_buttons}"
         [ "$is_first" = "0" ] && kb="${kb},"
         kb="${kb}[{\"text\":\"${E_ADD} Add Proxy\",\"callback_data\":\"cmd_up_add\"},{\"text\":\"${E_ERR} Disable All\",\"callback_data\":\"cmd_up_disable_all\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
@@ -696,13 +846,35 @@ handle_command() {
         uci_safe_commit; /etc/init.d/telemt restart; handle_command "cmd_upstreams"
         ;;
 
+    # Upstream creation: step 1 — choose type
     "cmd_up_add")
+        local kb="{\"inline_keyboard\":[[{\"text\":\"SOCKS5\",\"callback_data\":\"up_create_socks5\"},{\"text\":\"SOCKS4\",\"callback_data\":\"up_create_socks4\"},{\"text\":\"Direct\",\"callback_data\":\"up_create_direct\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_upstreams\"}]]}"
+        send_message "${E_ADD} <b>Add Upstream Proxy</b>\n\nChoose proxy type:" "$kb"
+        ;;
+
+    # Upstream creation: step 2 — create with chosen type
+    up_create_direct)
         local n="up_$(awk 'BEGIN{srand(); printf "%04x", rand()*65535}')"
         uci_safe set "telemt.${n}=upstream"
-        uci_safe set "telemt.${n}.type=socks5"
+        uci_safe set "telemt.${n}.type=direct"
+        uci_safe set "telemt.${n}.weight=10"
+        uci_safe set "telemt.${n}.enabled=1"
+        uci_safe_commit
+        send_message "${E_OK} Direct upstream created."
+        handle_command "up_manage_${n}"
+        ;;
+
+    up_create_socks4|up_create_socks5)
+        local stype="${cmd#up_create_}"
+        local n="up_$(awk 'BEGIN{srand(); printf "%04x", rand()*65535}')"
+        uci_safe set "telemt.${n}=upstream"
+        uci_safe set "telemt.${n}.type=${stype}"
         uci_safe set "telemt.${n}.address=127.0.0.1:1080"
+        uci_safe set "telemt.${n}.weight=10"
         uci_safe set "telemt.${n}.enabled=0"
-        uci_safe_commit; /etc/init.d/telemt restart; handle_command "up_manage_${n}"
+        uci_safe_commit
+        echo "upedit_${n}" > "$STATE_FILE"
+        send_message "${E_EDIT} Created ${stype} upstream.\nEnter proxy address (<code>IP:PORT</code>):"
         ;;
 
     up_manage_*)
@@ -710,12 +882,15 @@ handle_command() {
         [ "$(uci -q get "telemt.${u}")" != "upstream" ] && return
         local t=$(uci -q get "telemt.${u}.type" || echo "socks5")
         local a=$(uci -q get "telemt.${u}.address" || echo "-")
+        local w=$(uci -q get "telemt.${u}.weight" || echo "10")
+        local al=$(uci -q get "telemt.${u}.alias" || echo "")
         local en=$(uci -q get "telemt.${u}.enabled" | awk '{print tolower($1)}'); [ -z "$en" ] && en="1"
-        local st="${E_OK} ENABLED"; local t_btn="${E_ERR} Disable"
+        local st="${E_OK} ENABLED"; local t_btn="${E_FRZ} Freeze"
         if [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ]; then
-            st="${E_ERR} DISABLED"; t_btn="${E_OK} Enable"; fi
-        local out="${E_GLOB} <b>Upstream Proxy Settings</b>\n\n<b>Type:</b> ${t}\n<b>Address:</b> <code>${a}</code>\n<b>Status:</b> ${st}\n\n<i>Note: Use Apply button to activate changes.</i>"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${E_EDIT} Edit Addr\",\"callback_data\":\"up_edit_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_upstreams\"}]]}"
+            st="${E_FRZ} FROZEN"; t_btn="${E_OK} Enable"; fi
+        local name_str=""; [ -n "$al" ] && name_str="\n<b>Name:</b> ${al}"
+        local out="${E_GLOB} <b>Upstream Proxy Settings</b>\n\n<b>Type:</b> ${t}${name_str}\n<b>Address:</b> <code>${a}</code>\n<b>Weight:</b> ${w}\n<b>Status:</b> ${st}\n\n<i>Use Apply to activate changes.</i>"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${E_EDIT} Edit Addr\",\"callback_data\":\"up_edit_${u}\"}],[{\"text\":\"${E_EDIT} Type\",\"callback_data\":\"up_chtype_${u}\"},{\"text\":\"${E_WGT} Weight\",\"callback_data\":\"up_chweight_${u}\"},{\"text\":\"${E_EDIT} Name\",\"callback_data\":\"up_chalias_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_upstreams\"}]]}"
         send_message "$out" "$kb"
         ;;
 
@@ -731,6 +906,31 @@ handle_command() {
     up_edit_*)
         echo "upedit_${cmd#up_edit_}" > "$STATE_FILE"
         send_message "${E_EDIT} Enter new proxy address (<code>IP:PORT</code>):"
+        ;;
+
+    up_chtype_*)
+        local u="${cmd#up_chtype_}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"SOCKS5\",\"callback_data\":\"up_settype_socks5_${u}\"},{\"text\":\"SOCKS4\",\"callback_data\":\"up_settype_socks4_${u}\"},{\"text\":\"Direct\",\"callback_data\":\"up_settype_direct_${u}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"up_manage_${u}\"}]]}"
+        send_message "Select new proxy type:" "$kb"
+        ;;
+
+    up_settype_*)
+        local rest="${cmd#up_settype_}"
+        local newtype="${rest%%_*}"
+        local u="${rest#*_}"
+        uci_safe set "telemt.${u}.type=${newtype}"
+        [ "$newtype" = "direct" ] && uci_safe delete "telemt.${u}.address" 2>/dev/null
+        uci_safe_commit; handle_command "up_manage_${u}"
+        ;;
+
+    up_chweight_*)
+        echo "upweight_${cmd#up_chweight_}" > "$STATE_FILE"
+        send_message "${E_WGT} Enter weight (number, e.g. 10):"
+        ;;
+
+    up_chalias_*)
+        echo "upalias_${cmd#up_chalias_}" > "$STATE_FILE"
+        send_message "${E_EDIT} Enter upstream name (or send . to clear):"
         ;;
 
     up_del_confirm_*)
@@ -958,7 +1158,10 @@ handle_command() {
 
 cleanup() {
     logger -t telemt-bot "Shutting down (PID $$)..."
+    trap '' INT TERM
     [ -n "$HEALTH_PID" ] && kill "$HEALTH_PID" 2>/dev/null
+    # Kill entire process group (curl, sleep, wget children from long-polling)
+    kill 0 2>/dev/null
     rm -f "$STATE_FILE" "$UCI_LOCK" "$HEALTH_STATE_FILE" "$WAN_IP_FILE"
     exit 0
 }
@@ -967,7 +1170,7 @@ trap cleanup INT TERM
 logger -t telemt-bot "Starting v${BOT_VERSION} Long Polling loop..."
 update_proxy_cache
 cache_versions
-refresh_wan_ip &
+refresh_wan_ip
 start_health_daemon
 
 while true; do
