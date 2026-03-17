@@ -2,6 +2,7 @@
 # nFPM Build Configuration — telemt-bot
 # Sidecar Telegram bot for telemt MTProxy management on OpenWrt.
 # Reads UCI config from /etc/config/telemt (shared with luci-app-telemt).
+# Creates minimal UCI skeleton on install if luci-app-telemt is absent (headless).
 # ==============================================================================
 name: "telemt-bot"
 platform: "linux"
@@ -13,7 +14,8 @@ description: |
   Autonomous Telegram bot for managing telemt MTProxy on OpenWrt routers.
   Features: 3-tier failover (SOCKS→Direct→Emergency IP), health-check daemon,
   user/upstream CRUD via inline keyboards, UCI-native config, procd service.
-  Works standalone or alongside luci-app-telemt (shared UCI config).
+  Works standalone (headless) or alongside luci-app-telemt (shared UCI config).
+  Postinst creates /etc/config/telemt skeleton if missing.
 
 depends:
   - libc

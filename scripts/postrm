@@ -1,6 +1,20 @@
 #!/bin/sh
-# Post-remove: cleanup temp files
+# ==============================================================================
+# telemt-bot — Post-remove script
+# Cleanup temp files.
+# Disable bot in UCI so init.d/telemt reload won't try to start missing script.
+# Does NOT delete /etc/config/telemt or user's bot_token/bot_chat_id —
+# user may reinstall, and the config is shared with other telemt packages.
+# ==============================================================================
 
+# Cleanup runtime temp files
 rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock /var/run/telemt-bot.pid
+
+# Mark bot as disabled in UCI (safe no-op if config doesn't exist)
+if uci -q get telemt.general.bot_enabled >/dev/null 2>&1; then
+    uci set telemt.general.bot_enabled='0'
+    uci commit telemt 2>/dev/null
+    logger -t telemt-bot "postrm: bot_enabled set to 0 (package removed)"
+fi
 
 exit 0

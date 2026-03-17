@@ -1,5 +1,9 @@
 #!/bin/sh
-# Pre-remove: stop the bot service gracefully
+# ==============================================================================
+# telemt-bot — Pre-remove script
+# Stop service, disable autostart.
+# Does NOT touch /etc/config/telemt — shared with luci-app-telemt and init.d.
+# ==============================================================================
 
 /etc/init.d/telemt-bot stop 2>/dev/null
 /etc/init.d/telemt-bot disable 2>/dev/null

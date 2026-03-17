@@ -70,6 +70,27 @@ uci commit telemt
 /etc/init.d/telemt-bot start
 ```
 
+### Headless Install (without luci-app-telemt)
+
+The bot reads all settings from UCI (`/etc/config/telemt`). Normally this file is created by `luci-app-telemt`, but if you run a headless setup (telemt binary + bot only), the **postinst script automatically creates a minimal UCI skeleton**:
+
+```
+config telemt 'general'
+    option enabled '0'
+    option mode 'tls'
+    option domain 'google.com'
+    option port '8443'
+    option metrics_port '9092'
+    option api_port '9091'
+    option bot_enabled '0'
+
+config telemt 'network'
+```
+
+After install, just configure via `uci set` as shown above. If you later install `luci-app-telemt`, it will use the same config file — no conflicts.
+
+> **Note:** If `/etc/config/telemt` already exists (from luci-app-telemt or a previous install), the postinst will not overwrite it — only ensures the `general` section and `bot_enabled` key are present.
+
 ### Verify
 
 ```sh
@@ -111,6 +132,24 @@ api_request() called
        ✗ → ALL TIERS FAILED (logged)
 ```
 
+## LuCI Integration (CBI Patch)
+
+If you have `luci-app-telemt` installed, apply `cbi-lua-patch.lua` to add bot management to the "Telegram Bot" tab. The patch adds:
+
+### CHANGE 1 — Extend AJAX detection (line ~83)
+Add `or http.formvalue("bot_action") or http.formvalue("get_bot_status")` to the `is_ajax` variable.
+
+### CHANGE 2 — Insert AJAX handlers (after line ~120)
+Insert the `bot_action` and `get_bot_status` handlers after the existing `telemt_action` block.
+
+### CHANGE 3 — Replace Bot tab UI (lines ~738-756)
+Replace the minimal 3-field bot tab with the full dashboard including:
+- **Live status** — RUNNING/STOPPED with PID
+- **Memory** — RSS of the bot process
+- **Route indicator** — SOCKS (green) / DIRECT (orange) / UNKNOWN (grey)
+- **Control buttons** — Start / Stop / Restart with visual feedback
+- **Auto-polling** — refreshes every 10s, pauses when tab is hidden
+
 ## Bot Commands (Telegram)
 
 | Command | Description |
@@ -131,6 +170,16 @@ All management is done via inline keyboard buttons — no need to type commands.
 | `bot_chat_id` | `general` | Admin Telegram chat ID |
 
 All other options (users, upstreams, ports, etc.) are read from the same UCI config that LuCI manages.
+
+The UCI config file `/etc/config/telemt` is **shared** between `luci-app-telemt`, the telemt init.d script, and `telemt-bot`. Installing/removing `telemt-bot` never deletes this file.
+
+## Package Lifecycle Scripts
+
+| Script | What it does |
+|---|---|
+| **postinst** | Creates `/etc/config/telemt` skeleton if missing (headless), ensures `[general]` section and `bot_enabled` key exist, enables procd service, auto-starts if `bot_enabled=1` |
+| **prerm** | Stops bot, disables procd autostart. Does NOT touch UCI config |
+| **postrm** | Cleans temp files (`/tmp/telemt_bot_state`, etc.), sets `bot_enabled=0` in UCI so other init scripts don't try to start a removed binary |
 
 ## Security
 

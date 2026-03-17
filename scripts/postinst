@@ -1,13 +1,54 @@
 #!/bin/sh
-# Post-install: set permissions, enable and auto-start if configured
+# ==============================================================================
+# telemt-bot — Post-install script
+# Handles both scenarios:
+#   A) luci-app-telemt already installed → /etc/config/telemt exists, just enable
+#   B) Headless install (binary only) → must create UCI skeleton first
+# ==============================================================================
 
 chmod +x /usr/bin/telemt-bot 2>/dev/null
 chmod +x /etc/init.d/telemt-bot 2>/dev/null
 
-# Enable procd service (won't start until bot_enabled=1 in UCI)
+# ─── Ensure /etc/config/telemt exists with at least a [general] section ───
+# Without this file, ALL uci commands fail — including user's own uci set.
+UCI_CONF="/etc/config/telemt"
+
+if [ ! -f "$UCI_CONF" ]; then
+    logger -t telemt-bot "postinst: UCI config missing — creating minimal skeleton for headless mode"
+    cat > "$UCI_CONF" <<'EOF'
+config telemt 'general'
+	option enabled '0'
+	option mode 'tls'
+	option domain 'google.com'
+	option port '8443'
+	option metrics_port '9092'
+	option api_port '9091'
+	option bot_enabled '0'
+
+config telemt 'network'
+
+EOF
+fi
+
+# ─── Ensure 'general' section exists (file might exist but be empty/broken) ───
+if ! uci -q get telemt.general >/dev/null 2>&1; then
+    logger -t telemt-bot "postinst: UCI [general] section missing — adding"
+    uci set telemt.general='telemt'
+    uci set telemt.general.enabled='0'
+    uci set telemt.general.bot_enabled='0'
+    uci commit telemt 2>/dev/null
+fi
+
+# ─── Ensure bot_enabled key exists (luci-app-telemt may not have created it) ───
+if [ -z "$(uci -q get telemt.general.bot_enabled)" ]; then
+    uci set telemt.general.bot_enabled='0'
+    uci commit telemt 2>/dev/null
+fi
+
+# ─── Enable procd service (won't start until bot_enabled=1 + token set) ───
 /etc/init.d/telemt-bot enable 2>/dev/null
 
-# Auto-start if already configured
+# ─── Auto-start if already configured ───
 enabled=$(uci -q get telemt.general.bot_enabled)
 if [ "$enabled" = "1" ]; then
     /etc/init.d/telemt-bot start 2>/dev/null &
