@@ -5,7 +5,7 @@
 # ==============================================================================
 name: "telemt-bot"
 platform: "linux"
-version: "8.0.0"
+version: "3.3.20"
 section: "net"
 maintainer: "Medvedolog <Medvedolog@github.com>"
 homepage: "https://github.com/Medvedolog/telemt-bot"

@@ -43,18 +43,18 @@ telemt-bot/
 
 ```sh
 # Download the latest release
-wget https://github.com/Medvedolog/telemt-bot/releases/latest/download/telemt-bot_8.0.0_all.ipk
+wget https://github.com/Medvedolog/telemt-bot/releases/latest/download/telemt-bot_3.3.20_all.ipk
 
 # Install (curl is recommended for SOCKS and Emergency IP support)
 opkg update
 opkg install curl
-opkg install telemt-bot_8.0.0_all.ipk
+opkg install telemt-bot_3.3.20_all.ipk
 ```
 
 ### From GitHub Release (apk — OpenWrt 24+)
 
 ```sh
-apk add --allow-untrusted telemt-bot_8.0.0_noarch.apk
+apk add --allow-untrusted telemt-bot_3.3.20_noarch.apk
 ```
 
 ### Configuration
