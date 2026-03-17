@@ -1,0 +1,53 @@
+# ==============================================================================
+# nFPM Build Configuration — telemt-bot
+# Sidecar Telegram bot for telemt MTProxy management on OpenWrt.
+# Reads UCI config from /etc/config/telemt (shared with luci-app-telemt).
+# ==============================================================================
+name: "telemt-bot"
+platform: "linux"
+version: "8.0.0"
+section: "net"
+maintainer: "Medvedolog <Medvedolog@github.com>"
+homepage: "https://github.com/Medvedolog/telemt-bot"
+description: |
+  Autonomous Telegram bot for managing telemt MTProxy on OpenWrt routers.
+  Features: 3-tier failover (SOCKS→Direct→Emergency IP), health-check daemon,
+  user/upstream CRUD via inline keyboards, UCI-native config, procd service.
+  Works standalone or alongside luci-app-telemt (shared UCI config).
+
+depends:
+  - libc
+  - jsonfilter
+  - libustream-wolfssl | libustream-mbedtls | libustream-openssl
+  - ca-bundle | ca-certificates
+  - uclient-fetch
+
+# curl is recommended for SOCKS proxy and Emergency IP failover.
+# Without curl, Tier 1 (SOCKS) and Tier 3 (--resolve) are unavailable.
+recommends:
+  - curl
+
+conflicts:
+  []
+
+contents:
+  - src: ./usr/bin/telemt-bot
+    dst: /usr/bin/telemt-bot
+    file_info:
+      mode: 0755
+
+  - src: ./etc/init.d/telemt-bot
+    dst: /etc/init.d/telemt-bot
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: ./scripts/postinst
+  preremove: ./scripts/prerm
+  postremove: ./scripts/postrm
+
+apk:
+  arch: "noarch"
+
+ipk:
+  arch: "all"
