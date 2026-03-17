@@ -1160,8 +1160,16 @@ cleanup() {
     logger -t telemt-bot "Shutting down (PID $$)..."
     trap '' INT TERM
     [ -n "$HEALTH_PID" ] && kill "$HEALTH_PID" 2>/dev/null
-    # Kill entire process group (curl, sleep, wget children from long-polling)
-    kill 0 2>/dev/null
+    # Kill only our direct children, NOT the entire process group
+    # (kill 0 can take down procd/uhttpd on OpenWrt)
+    local cpid
+    for cpid in $(pgrep -P $$ 2>/dev/null); do
+        kill "$cpid" 2>/dev/null
+    done
+    sleep 1
+    for cpid in $(pgrep -P $$ 2>/dev/null); do
+        kill -KILL "$cpid" 2>/dev/null
+    done
     rm -f "$STATE_FILE" "$UCI_LOCK" "$HEALTH_STATE_FILE" "$WAN_IP_FILE"
     exit 0
 }
