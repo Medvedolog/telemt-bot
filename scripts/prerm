@@ -1,0 +1,7 @@
+#!/bin/sh
+# Pre-remove: stop the bot service gracefully
+
+/etc/init.d/telemt-bot stop 2>/dev/null
+/etc/init.d/telemt-bot disable 2>/dev/null
+
+exit 0

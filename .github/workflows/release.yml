@@ -1,0 +1,179 @@
+# ==============================================================================
+# Telemt-Bot — Build & Release Workflow
+# Builds IPK (OpenWrt) and APK (OpenWrt 24+) packages using nFPM.
+# Pure shell script package (arch: noarch / all).
+#
+# Trigger:
+#   1. Push tag matching semver: "8.*", "9.*", etc.
+#   2. Manual dispatch: enter version string (e.g. "8.0.0")
+# ==============================================================================
+
+name: Build and Release telemt-bot
+
+on:
+  push:
+    tags:
+      - '[0-9]*'
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g. 8.0.0)'
+        required: true
+        default: '8.0.0'
+
+jobs:
+  release:
+    name: Build IPK + APK and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ─────────────────────────────────────────────────────────────────────────
+      # 1. Determine version
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Determine version
+        id: vars
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="nightly"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "Resolved VERSION=${VERSION}"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 2. Checkout repo
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 3. Install nFPM
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Install nFPM
+        run: |
+          NFPM_TAG=$(curl -sL https://api.github.com/repos/goreleaser/nfpm/releases/latest | jq -r .tag_name)
+          NFPM_VER=${NFPM_TAG#v}
+          echo "Installing nFPM ${NFPM_VER}"
+          curl -sSfL \
+            "https://github.com/goreleaser/nfpm/releases/download/${NFPM_TAG}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" \
+            | tar -xz nfpm
+          sudo mv nfpm /usr/local/bin/
+          nfpm --version
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 4. Install dos2unix
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Install dos2unix
+        run: sudo apt-get update -qq && sudo apt-get install -y dos2unix
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 5. Fix CRLF and BOM in all shell scripts
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Fix CRLF and BOM
+        run: |
+          # Fix install/remove scripts
+          if [ -d scripts ]; then
+            find scripts -type f | xargs dos2unix
+            find scripts -type f | xargs sed -i '1s/^\xef\xbb\xbf//'
+          fi
+          # Fix the bot script itself
+          dos2unix usr/bin/telemt-bot 2>/dev/null || true
+          sed -i '1s/^\xef\xbb\xbf//' usr/bin/telemt-bot 2>/dev/null || true
+          # Fix init.d script
+          dos2unix etc/init.d/telemt-bot 2>/dev/null || true
+          sed -i '1s/^\xef\xbb\xbf//' etc/init.d/telemt-bot 2>/dev/null || true
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 6. Patch version in nfpm.yaml and in bot script
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Patch version
+        run: |
+          PKG_VER="${{ env.VERSION }}"
+          echo "Updating nfpm.yaml version → ${PKG_VER}"
+          sed -i "s/^version:.*$/version: \"${PKG_VER}\"/" nfpm.yaml
+          grep "^version:" nfpm.yaml
+
+          # Also patch BOT_VERSION inside the script
+          sed -i "s/^BOT_VERSION=.*/BOT_VERSION=\"${PKG_VER}\"/" usr/bin/telemt-bot
+          grep "BOT_VERSION=" usr/bin/telemt-bot | head -1
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 7. Build IPK
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Build IPK package
+        run: |
+          PKG_VER="${{ env.VERSION }}"
+          export SOURCE_DATE_EPOCH=1704067200
+
+          nfpm pkg \
+            --config nfpm.yaml \
+            --packager ipk \
+            --target "telemt-bot_${PKG_VER}_all.ipk"
+
+          echo "Built: telemt-bot_${PKG_VER}_all.ipk"
+          ls -lh telemt-bot_*.ipk
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 8. Build APK
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Build APK package
+        run: |
+          PKG_VER="${{ env.VERSION }}"
+          unset SOURCE_DATE_EPOCH
+
+          nfpm pkg \
+            --config nfpm.yaml \
+            --packager apk \
+            --target "telemt-bot_${PKG_VER}_noarch.apk"
+
+          echo "Built: telemt-bot_${PKG_VER}_noarch.apk"
+          ls -lh telemt-bot_*.apk
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 9. Create GitHub Release
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          name: "Release ${{ env.VERSION }}"
+          tag_name: "${{ env.VERSION }}"
+          prerelease: false
+          draft: false
+          body: |
+            ## telemt-bot ${{ env.VERSION }}
+
+            Autonomous Telegram bot for managing telemt MTProxy on OpenWrt routers.
+            3-tier failover, health-check daemon, UCI-native — works standalone or with luci-app-telemt.
+
+            ### Installation (opkg)
+            ```sh
+            # Download and install
+            wget https://github.com/Medvedolog/telemt-bot/releases/download/${{ env.VERSION }}/telemt-bot_${{ env.VERSION }}_all.ipk
+            opkg install telemt-bot_${{ env.VERSION }}_all.ipk
+
+            # Configure via UCI
+            uci set telemt.general.bot_enabled='1'
+            uci set telemt.general.bot_token='YOUR_BOT_TOKEN'
+            uci set telemt.general.bot_chat_id='YOUR_CHAT_ID'
+            uci commit telemt
+            /etc/init.d/telemt-bot start
+            ```
+
+            ### Installation (apk — OpenWrt 24+)
+            ```sh
+            apk add --allow-untrusted telemt-bot_${{ env.VERSION }}_noarch.apk
+            ```
+
+            ### Dependencies
+            - **Required:** `jsonfilter`, `libustream-*ssl`, `ca-bundle`, `uclient-fetch`
+            - **Recommended:** `curl` (enables SOCKS proxy and Emergency IP failover)
+          files: |
+            telemt-bot_*.ipk
+            telemt-bot_*.apk

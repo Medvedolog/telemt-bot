@@ -1,0 +1,16 @@
+#!/bin/sh
+# Post-install: set permissions, enable and auto-start if configured
+
+chmod +x /usr/bin/telemt-bot 2>/dev/null
+chmod +x /etc/init.d/telemt-bot 2>/dev/null
+
+# Enable procd service (won't start until bot_enabled=1 in UCI)
+/etc/init.d/telemt-bot enable 2>/dev/null
+
+# Auto-start if already configured
+enabled=$(uci -q get telemt.general.bot_enabled)
+if [ "$enabled" = "1" ]; then
+    /etc/init.d/telemt-bot start 2>/dev/null &
+fi
+
+exit 0

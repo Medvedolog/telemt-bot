@@ -1,0 +1,58 @@
+#!/bin/sh /etc/rc.common
+# ==============================================================================
+# Telemt-Bot — procd service definition
+# Sidecar Telegram bot for telemt MTProxy management
+# ==============================================================================
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/telemt-bot
+CONF=telemt
+
+start_service() {
+    local enabled
+    config_load "$CONF"
+    config_get enabled general bot_enabled "0"
+
+    [ "$enabled" = "1" ] || {
+        logger -t telemt-bot "Service disabled in UCI (bot_enabled=0). Not starting."
+        return 0
+    }
+
+    local token chat_id
+    config_get token general bot_token ""
+    config_get chat_id general bot_chat_id ""
+
+    [ -n "$token" ] && [ -n "$chat_id" ] || {
+        logger -t telemt-bot "Error: bot_token or bot_chat_id not configured. Not starting."
+        return 1
+    }
+
+    procd_open_instance "telemt-bot"
+    procd_set_param command "$PROG"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 0
+    procd_set_param stderr 1
+    procd_set_param pidfile /var/run/telemt-bot.pid
+    procd_set_param file /etc/config/telemt
+    procd_close_instance
+
+    logger -t telemt-bot "Service started."
+}
+
+stop_service() {
+    logger -t telemt-bot "Service stopping..."
+    # Cleanup temp files
+    rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock
+}
+
+service_triggers() {
+    procd_add_reload_trigger "$CONF"
+}
+
+reload_service() {
+    stop
+    start
+}

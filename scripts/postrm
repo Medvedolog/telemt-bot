@@ -1,0 +1,6 @@
+#!/bin/sh
+# Post-remove: cleanup temp files
+
+rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock /var/run/telemt-bot.pid
+
+exit 0

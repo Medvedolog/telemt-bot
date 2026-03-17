@@ -1,0 +1,964 @@
+#!/bin/sh
+# ==============================================================================
+# Telemt Telegram Bot (ash / OpenWrt native)
+# Version: 8.0.0 (Resilient Edge Edition)
+# Changes from 7.4.0:
+#   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
+#   - Fast timeouts (--connect-timeout 5 / --max-time 15) — no more 10-20s hangs
+#   - Emergency Telegram API IP list for DNS Poisoning bypass
+#   - Health-check daemon with auto-notifications
+#   - UCI flock for safe concurrent access with LuCI
+#   - Route tracking & diagnostics in logs
+# ==============================================================================
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+BOT_VERSION="8.0.0"
+
+# ──────────────────────────────────────────────
+# 0. UCI Config & Auth
+# ──────────────────────────────────────────────
+TOKEN=$(uci -q get telemt.general.bot_token)
+ADMIN_ID=$(uci -q get telemt.general.bot_chat_id)
+
+if [ -z "$TOKEN" ] || [ -z "$ADMIN_ID" ]; then
+    logger -t telemt-bot "FATAL: Bot token or Admin Chat ID not set in UCI."
+    exit 1
+fi
+
+API_URL="https://api.telegram.org/bot${TOKEN}"
+OFFSET=0
+STATE_FILE="/tmp/telemt_bot_state"
+CACHED_PROXY=""
+UCI_LOCK="/tmp/telemt_uci.lock"
+HEALTH_STATE_FILE="/tmp/telemt_health_state"
+
+# ──────────────────────────────────────────────
+# 0a. Timeouts (seconds)
+# ──────────────────────────────────────────────
+CURL_CONNECT_TIMEOUT=5
+CURL_MAX_TIME=15
+UCLIENT_TIMEOUT=10
+POLL_TIMEOUT=50
+
+# ──────────────────────────────────────────────
+# 0b. Emergency Telegram API IPs (DC2 + DC4/5)
+#     Used ONLY when system DNS is poisoned and
+#     SOCKS proxy is down. Last resort.
+# ──────────────────────────────────────────────
+TG_EMERGENCY_IPS="149.154.167.220 149.154.167.198 91.108.4.249"
+
+# ──────────────────────────────────────────────
+# 0c. Emoji constants
+# ──────────────────────────────────────────────
+E_OK="\u2705"; E_ERR="\u26d4"; E_INF="\u221e"; E_GLOB="\ud83c\udf10"
+E_STAT="\ud83d\udcca"; E_DWN="\u2b07\ufe0f"; E_UP="\u2b06\ufe0f"; E_SHLD="\ud83d\udee1\ufe0f"
+E_RTR="\ud83d\udda5\ufe0f"; E_PRX="\ud83d\udd0c"; E_USR="\ud83d\udc65"; E_SET="\u2699\ufe0f"
+E_ADD="\u2795"; E_BACK="\u2b05\ufe0f"; E_FILE="\ud83d\udcc4"; E_CSV="\ud83d\udcca"
+E_LOG="\ud83d\udccb"; E_RST="\ud83d\udd04"; E_STP="\ud83d\uded1"; E_FRZ="\u2744\ufe0f"
+E_DEL="\ud83d\uddd1\ufe0f"; E_CAL="\ud83d\udcc5"; E_KEY="\ud83d\udd11"; E_RGN="\ud83d\udd03"
+E_PRF="\ud83d\udc64"; E_WARN="\u26a0\ufe0f"; E_EDIT="\u270f\ufe0f"; E_LINK="\ud83d\udd17"
+E_CPU="\u2699\ufe0f"; E_RAM="\ud83d\udcbe"; E_TRAF="\ud83d\udcc8"; E_VER="\ud83d\udce6"
+E_OS="\ud83d\udc27"; E_NET="\ud83d\udd17"
+
+# ==============================================================================
+# 1. NETWORK LAYER — 3-TIER FAILOVER
+# ==============================================================================
+
+# ─── 1a. SOCKS discovery (cached) ────────────────────
+get_active_socks() {
+    local p_url=""
+    for up in $(uci show telemt | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+        local en=$(uci -q get "telemt.${up}.enabled" | tr -d '"')
+        if [ "$en" = "1" ] || [ "$en" = "true" ] || [ "$en" = "on" ] || [ -z "$en" ]; then
+            local type=$(uci -q get "telemt.${up}.type" | tr -d '"')
+            if [ "$type" = "socks5" ] || [ "$type" = "socks4" ]; then
+                local addr=$(uci -q get "telemt.${up}.address" | tr -d '"' | tr -d ' ')
+                if [ -n "$addr" ]; then
+                    [ "$type" = "socks5" ] && p_url="socks5h://${addr}"
+                    [ "$type" = "socks4" ] && p_url="socks4a://${addr}"
+                    break
+                fi
+            fi
+        fi
+    done
+    echo "$p_url"
+}
+
+update_proxy_cache() { CACHED_PROXY=$(get_active_socks); }
+
+# ─── 1b. Tier 1: SOCKS proxy via curl ────────────────
+_try_socks() {
+    local method="$1" payload="$2"
+    [ -z "$CACHED_PROXY" ] && return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    local res
+    res=$(curl -s -k \
+        --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+        --max-time "$CURL_MAX_TIME" \
+        -x "$CACHED_PROXY" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "${API_URL}/${method}" 2>/dev/null)
+
+    if echo "$res" | grep -q '"ok":true'; then
+        echo "$res"; return 0
+    fi
+    return 1
+}
+
+# ─── 1c. Tier 2: Direct via system DNS (uclient-fetch) ─
+_try_direct_dns() {
+    local method="$1" payload="$2"
+    local res
+    res=$(uclient-fetch -q -O - \
+        --timeout="$UCLIENT_TIMEOUT" \
+        --post-data="$payload" \
+        --header="Content-Type: application/json" \
+        "${API_URL}/${method}" 2>/dev/null)
+
+    if echo "$res" | grep -q '"ok":true'; then
+        echo "$res"; return 0
+    fi
+    return 1
+}
+
+# ─── 1d. Tier 3: Direct via hardcoded IP (--resolve) ─
+_try_direct_hardcoded() {
+    local method="$1" payload="$2"
+    command -v curl >/dev/null 2>&1 || return 1
+
+    local ip res
+    for ip in $TG_EMERGENCY_IPS; do
+        res=$(curl -s -k \
+            --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+            --max-time "$CURL_MAX_TIME" \
+            --resolve "api.telegram.org:443:${ip}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "${API_URL}/${method}" 2>/dev/null)
+
+        if echo "$res" | grep -q '"ok":true'; then
+            logger -t telemt-bot "NET: Tier3 success via emergency IP ${ip}"
+            echo "$res"; return 0
+        fi
+    done
+    return 1
+}
+
+# ─── 1e. Master request dispatcher ───────────────────
+# Returns: JSON response on stdout, exit code 0 on success.
+# Side effect: logs which tier succeeded.
+LAST_ROUTE="none"
+
+api_request() {
+    local method="$1" payload="$2" res=""
+
+    # Tier 1 — SOCKS
+    if res=$(_try_socks "$method" "$payload"); then
+        [ "$LAST_ROUTE" != "socks" ] && logger -t telemt-bot "NET: Route -> SOCKS (${CACHED_PROXY})"
+        LAST_ROUTE="socks"
+        echo "$res"; return 0
+    fi
+
+    # Tier 2 — Direct + system DNS
+    if res=$(_try_direct_dns "$method" "$payload"); then
+        [ "$LAST_ROUTE" != "direct" ] && logger -t telemt-bot "NET: Route -> Direct (system DNS)"
+        LAST_ROUTE="direct"
+        echo "$res"; return 0
+    fi
+
+    # Tier 3 — Direct + hardcoded IP (DNS poisoning bypass)
+    if res=$(_try_direct_hardcoded "$method" "$payload"); then
+        [ "$LAST_ROUTE" != "emergency" ] && logger -t telemt-bot "NET: Route -> EMERGENCY (hardcoded IP)"
+        LAST_ROUTE="emergency"
+        echo "$res"; return 0
+    fi
+
+    logger -t telemt-bot "NET: ALL TIERS FAILED for ${method}"
+    LAST_ROUTE="none"
+    return 1
+}
+
+# ─── 1f. Long-poll specific request (longer timeout) ─
+api_poll() {
+    local url="${API_URL}/getUpdates?offset=${OFFSET}&timeout=${POLL_TIMEOUT}"
+    local res=""
+
+    # Tier 1 — SOCKS
+    if [ -n "$CACHED_PROXY" ] && command -v curl >/dev/null 2>&1; then
+        res=$(curl -s -k \
+            --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+            --max-time $((POLL_TIMEOUT + 10)) \
+            -x "$CACHED_PROXY" \
+            "$url" 2>/dev/null)
+        if echo "$res" | grep -q '"ok":true'; then echo "$res"; return 0; fi
+    fi
+
+    # Tier 2 — Direct + DNS
+    res=$(uclient-fetch -q -O - --timeout=$((POLL_TIMEOUT + 10)) "$url" 2>/dev/null)
+    if echo "$res" | grep -q '"ok":true'; then echo "$res"; return 0; fi
+
+    # Tier 3 — Hardcoded IP
+    if command -v curl >/dev/null 2>&1; then
+        local ip
+        for ip in $TG_EMERGENCY_IPS; do
+            res=$(curl -s -k \
+                --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+                --max-time $((POLL_TIMEOUT + 10)) \
+                --resolve "api.telegram.org:443:${ip}" \
+                "$url" 2>/dev/null)
+            if echo "$res" | grep -q '"ok":true'; then echo "$res"; return 0; fi
+        done
+    fi
+    return 1
+}
+
+# ==============================================================================
+# 2. MESSAGING LAYER
+# ==============================================================================
+
+send_message() {
+    local text="$1" keyboard="$2"
+    text=$(printf "%s" "$text" | tr -d '\r\t' | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+    local json="{\"chat_id\":\"${ADMIN_ID}\",\"text\":\"${text}\",\"parse_mode\":\"HTML\""
+    [ -n "$keyboard" ] && json="${json},\"reply_markup\":${keyboard}"
+    json="${json}}"
+    api_request "sendMessage" "$json" >/dev/null
+}
+
+send_document() {
+    local file_path="$1" caption="$2"
+    local proxy="$CACHED_PROXY" res=""
+
+    # Try curl (supports both socks and multipart natively)
+    if command -v curl >/dev/null 2>&1; then
+        local proxy_flag=""
+        [ -n "$proxy" ] && proxy_flag="-x $proxy"
+
+        # Tier 1: via SOCKS
+        if [ -n "$proxy_flag" ]; then
+            res=$(curl -s -k \
+                --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+                --max-time 30 \
+                $proxy_flag \
+                -F "chat_id=${ADMIN_ID}" \
+                -F "document=@${file_path}" \
+                -F "caption=${caption}" \
+                -F "parse_mode=HTML" \
+                "${API_URL}/sendDocument" 2>/dev/null)
+            echo "$res" | grep -q '"ok":true' && return 0
+        fi
+
+        # Tier 3: via hardcoded IP (skipping uclient for multipart)
+        local ip
+        for ip in $TG_EMERGENCY_IPS; do
+            res=$(curl -s -k \
+                --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+                --max-time 30 \
+                --resolve "api.telegram.org:443:${ip}" \
+                -F "chat_id=${ADMIN_ID}" \
+                -F "document=@${file_path}" \
+                -F "caption=${caption}" \
+                -F "parse_mode=HTML" \
+                "${API_URL}/sendDocument" 2>/dev/null)
+            echo "$res" | grep -q '"ok":true' && return 0
+        done
+    fi
+
+    # Tier 2 fallback: uclient-fetch with manual multipart boundary
+    local bound="----TelemtBotBoundary" tmp_body="/tmp/tg_upload.tmp"
+    printf -- "--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n" "$bound" "$ADMIN_ID" > "$tmp_body"
+    [ -n "$caption" ] && printf -- "--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n" "$bound" "$caption" >> "$tmp_body"
+    printf -- "--%s\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n" "$bound" >> "$tmp_body"
+    printf -- "--%s\r\nContent-Disposition: form-data; name=\"document\"; filename=\"%s\"\r\nContent-Type: text/plain\r\n\r\n" "$bound" "$(basename "$file_path")" >> "$tmp_body"
+    cat "$file_path" >> "$tmp_body"
+    printf "\r\n--%s--\r\n" "$bound" >> "$tmp_body"
+    uclient-fetch -q -O - \
+        --timeout="$UCLIENT_TIMEOUT" \
+        --post-file="$tmp_body" \
+        --header="Content-Type: multipart/form-data; boundary=${bound}" \
+        "${API_URL}/sendDocument" >/dev/null 2>&1
+    rm -f "$tmp_body"
+}
+
+# ==============================================================================
+# 3. UCI SAFE ACCESS (flock wrapper)
+# ==============================================================================
+
+uci_safe() {
+    # Usage: uci_safe set telemt.foo.bar=baz
+    # Wraps uci calls with flock to prevent race with LuCI
+    local lock_fd=9
+    eval "exec ${lock_fd}>${UCI_LOCK}"
+    flock -w 3 $lock_fd 2>/dev/null || {
+        logger -t telemt-bot "UCI: Lock contention, proceeding without lock"
+    }
+    uci "$@"
+    local rc=$?
+    eval "exec ${lock_fd}>&-"
+    return $rc
+}
+
+uci_safe_commit() {
+    local lock_fd=9
+    eval "exec ${lock_fd}>${UCI_LOCK}"
+    flock -w 3 $lock_fd 2>/dev/null
+    uci commit telemt
+    local rc=$?
+    eval "exec ${lock_fd}>&-"
+    return $rc
+}
+
+# ==============================================================================
+# 4. HEALTH-CHECK DAEMON (background coroutine)
+# ==============================================================================
+# Runs every 60s. Detects:
+#   - telemt proxy process crash
+#   - SOCKS upstream unreachability
+#   - Route degradation (socks -> direct -> emergency)
+# Sends one-shot notification on state CHANGE (no spam).
+
+HEALTH_INTERVAL=60
+
+_health_read_state() {
+    cat "$HEALTH_STATE_FILE" 2>/dev/null || echo "unknown|unknown|0"
+}
+
+_health_write_state() {
+    echo "$1|$2|$(date +%s)" > "$HEALTH_STATE_FILE"
+}
+
+_check_proxy_process() {
+    pidof telemt >/dev/null 2>&1 && echo "running" || echo "stopped"
+}
+
+_check_socks_reachable() {
+    [ -z "$CACHED_PROXY" ] && echo "no_proxy" && return
+    command -v curl >/dev/null 2>&1 || { echo "no_curl"; return; }
+
+    # Quick test: try to reach TG API through SOCKS with tight timeout
+    local res
+    res=$(curl -s -k \
+        --connect-timeout 3 \
+        --max-time 5 \
+        -x "$CACHED_PROXY" \
+        "${API_URL}/getMe" 2>/dev/null)
+
+    if echo "$res" | grep -q '"ok":true'; then
+        echo "reachable"
+    else
+        echo "unreachable"
+    fi
+}
+
+health_check_tick() {
+    local prev_state=$(_health_read_state)
+    local prev_proc=$(echo "$prev_state" | cut -d'|' -f1)
+    local prev_socks=$(echo "$prev_state" | cut -d'|' -f2)
+
+    local cur_proc=$(_check_proxy_process)
+    local cur_socks=$(_check_socks_reachable)
+
+    # ── Process state change ──
+    if [ "$cur_proc" != "$prev_proc" ] && [ "$prev_proc" != "unknown" ]; then
+        if [ "$cur_proc" = "stopped" ]; then
+            logger -t telemt-bot "HEALTH: Telemt process CRASHED"
+            send_message "${E_ERR} <b>ALERT:</b> Telemt proxy process has stopped!\n\nUse /menu to restart."
+        elif [ "$cur_proc" = "running" ]; then
+            logger -t telemt-bot "HEALTH: Telemt process recovered"
+            send_message "${E_OK} <b>Recovered:</b> Telemt proxy is running again."
+        fi
+    fi
+
+    # ── SOCKS reachability change ──
+    if [ "$cur_socks" != "$prev_socks" ] && [ "$prev_socks" != "unknown" ]; then
+        if [ "$cur_socks" = "unreachable" ] && [ "$prev_socks" = "reachable" ]; then
+            logger -t telemt-bot "HEALTH: SOCKS upstream DOWN"
+            send_message "${E_WARN} <b>ALERT:</b> SOCKS upstream is unreachable!\nBot switched to: <b>${LAST_ROUTE}</b> route.\n\nProxy: <code>${CACHED_PROXY}</code>"
+        elif [ "$cur_socks" = "reachable" ] && [ "$prev_socks" = "unreachable" ]; then
+            logger -t telemt-bot "HEALTH: SOCKS upstream recovered"
+            send_message "${E_OK} <b>Recovered:</b> SOCKS upstream is back online.\nProxy: <code>${CACHED_PROXY}</code>"
+        fi
+    fi
+
+    _health_write_state "$cur_proc" "$cur_socks"
+}
+
+start_health_daemon() {
+    logger -t telemt-bot "HEALTH: Starting health-check daemon (interval: ${HEALTH_INTERVAL}s)"
+    _health_write_state "unknown" "unknown"
+    while true; do
+        sleep "$HEALTH_INTERVAL"
+        update_proxy_cache
+        health_check_tick
+    done &
+    HEALTH_PID=$!
+    logger -t telemt-bot "HEALTH: Daemon PID=${HEALTH_PID}"
+}
+
+# ==============================================================================
+# 5. COMMAND HANDLER (business logic — from v7.4 + improvements)
+# ==============================================================================
+
+handle_command() {
+    local cmd="$1"
+
+    # ── State machine: interactive text input ──
+    if [ -f "$STATE_FILE" ]; then
+        if echo "$cmd" | grep -qE '^(cmd_|user_|up_|mp_|/|\[)'; then
+            rm -f "$STATE_FILE"
+        else
+            local state=$(cat "$STATE_FILE"); rm -f "$STATE_FILE"
+            local action=$(echo "$state" | cut -d'_' -f1)
+            local tgt=$(echo "$state" | cut -d'_' -f2-)
+            case "$action" in
+                rename)
+                    local new_name=$(echo "$cmd" | tr -d ' \r\n\t')
+                    if echo "$new_name" | grep -q '[^a-zA-Z0-9_]' || [ -z "$new_name" ] || [ ${#new_name} -gt 15 ]; then
+                        send_message "${E_ERR} Invalid name! Use 1-15 letters, numbers or underscores."; return; fi
+                    if [ "$(uci -q get "telemt.${new_name}")" = "user" ]; then
+                        send_message "${E_ERR} User <b>${new_name}</b> already exists!"; return; fi
+                    uci_safe set "telemt.${new_name}=user"
+                    for field in secret data_quota max_unique_ips expire_date disabled max_tcp_conns ad_tag; do
+                        local val=$(uci -q get "telemt.${tgt}.${field}")
+                        [ -n "$val" ] && uci_safe set "telemt.${new_name}.${field}=${val}"
+                    done
+                    uci_safe delete "telemt.${tgt}"; uci_safe_commit
+                    send_message "${E_OK} User renamed! (Press Apply)"
+                    handle_command "user_manage_${new_name}"; return ;;
+                quota)
+                    [ "$cmd" = "0" ] && uci_safe delete "telemt.${tgt}.data_quota" || uci_safe set "telemt.${tgt}.data_quota=${cmd}"
+                    uci_safe_commit; send_message "${E_OK} Quota updated! (Press Apply)"; handle_command "user_manage_${tgt}"; return ;;
+                ips)
+                    [ "$cmd" = "0" ] && uci_safe delete "telemt.${tgt}.max_unique_ips" || uci_safe set "telemt.${tgt}.max_unique_ips=${cmd}"
+                    uci_safe_commit; send_message "${E_OK} Max IPs updated! (Press Apply)"; handle_command "user_manage_${tgt}"; return ;;
+                expiry)
+                    [ "$cmd" = "0" ] && uci_safe delete "telemt.${tgt}.expire_date" || uci_safe set "telemt.${tgt}.expire_date=${cmd}"
+                    uci_safe_commit; send_message "${E_OK} Expiry updated! (Press Apply)"; handle_command "user_manage_${tgt}"; return ;;
+                upedit)
+                    local new_addr=$(echo "$cmd" | tr -d ' \r\n\t')
+                    if echo "$new_addr" | grep -qE '^.+:[0-9]+$'; then
+                        uci_safe set "telemt.${tgt}.address=${new_addr}"; uci_safe_commit
+                        send_message "${E_OK} Upstream address updated! (Press Apply)"
+                    else send_message "${E_ERR} Invalid format! Must be IP:PORT."; fi
+                    handle_command "up_manage_${tgt}"; return ;;
+            esac
+        fi
+    fi
+
+    case "$cmd" in
+
+    # ── Main menu ──
+    "/start"|"/menu")
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}]]}"
+        local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
+        send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Route: <b>${LAST_ROUTE}</b>\nSelect an action:" "$kb"
+        ;;
+
+    # ── System status ──
+    "cmd_status"|"/status")
+        local uptime_sys=$(awk '{print int($1/86400)"d "int(($1%86400)/3600)"h "int(($1%3600)/60)"m"}' /proc/uptime)
+        local pid=$(pidof telemt | awk '{print $1}')
+        local p_status="STOPPED"; local s_icon="${E_ERR}"
+        if [ -n "$pid" ]; then p_status="RUNNING (PID: $pid)"; s_icon="${E_OK}"; fi
+
+        local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
+
+        local os_ver=$(awk -F"'" '/DISTRIB_DESCRIPTION/ {print $2}' /etc/openwrt_release 2>/dev/null)
+        [ -z "$os_ver" ] && os_ver="OpenWrt (Unknown)"
+
+        local core_ver=$(cat /tmp/telemt_version 2>/dev/null)
+        [ -z "$core_ver" ] && core_ver=$(cat /var/run/telemt_version 2>/dev/null)
+        [ -z "$core_ver" ] && core_ver=$(telemt -v 2>/dev/null | head -n 1 | awk '{print $NF}' | tr -d '\r\n ')
+        [ -z "$core_ver" ] && core_ver="Unknown"
+        local web_ver=$(opkg status luci-app-telemt 2>/dev/null | awk '/^Version:/ {print $2}' | tr -d '\r\n ')
+        [ -z "$web_ver" ] && web_ver="Unknown"
+
+        local proxy_str="$CACHED_PROXY"; local proxy_info="DIRECT"
+        [ -n "$proxy_str" ] && proxy_info="SOCKS (${proxy_str})"
+        local wan_ip=$(uclient-fetch -q -O - --timeout=3 "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
+        [ -z "$wan_ip" ] && wan_ip="Unknown"
+
+        local lan_ip=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')
+        local ts_ip=$(ip -4 addr show tailscale0 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')
+        local zt_ip=$(ip -4 addr show 2>/dev/null | awk '/inet / && / zt/ {split($2, a, "/"); print a[1]; exit}')
+
+        local ip_str=""
+        [ -n "$lan_ip" ] && ip_str="<b>LAN:</b> ${lan_ip} "
+        [ -n "$ts_ip" ] && ip_str="${ip_str}| <b>TS:</b> ${ts_ip} "
+        [ -n "$zt_ip" ] && ip_str="${ip_str}| <b>ZT:</b> ${zt_ip} "
+
+        local loadavg=$(cat /proc/loadavg | awk '{print $1", "$2", "$3}')
+        local free_ram=$(awk '/MemAvailable/{a=$2} /MemFree/{f=$2} /Buffers/{b=$2} /^Cached/{c=$2} END{if(a){print int(a/1024)}else{print int((f+b+c)/1024)}}' /proc/meminfo)
+        local proc_ram="0"
+        if [ -n "$pid" ]; then
+            proc_ram=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$pid/status 2>/dev/null)
+            [ -z "$proc_ram" ] && proc_ram="0"
+        fi
+
+        local m_port=$(uci -q get telemt.general.metrics_port || echo 9091)
+        local stat_out=""
+
+        if [ -n "$pid" ]; then
+            local r_live=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
+            local acc_stats=$(cat /tmp/telemt_stats.txt 2>/dev/null)
+
+            local awk_script='
+                BEGIN { tx_live=0; rx_live=0; act=0; dp=0; tx_acc=0; rx_acc=0; upt=0 }
+                /^LIVE_MARKER/ { mode=1; next }
+                /^ACC_MARKER/ { mode=2; next }
+                /telemt_user_octets_to_client/ { if(mode==1) tx_live+=$2 }
+                /telemt_user_octets_from_client/ { if(mode==1) rx_live+=$2 }
+                /telemt_user_connections_current/ { if(mode==1 && ($2+0)>0) act++ }
+                /telemt_desync_total/ { if(mode==1) dp=$2 }
+                /telemt_uptime_seconds/ { if(mode==1) upt=$2 }
+                { if (mode==2 && NF==3 && !match($0, /^telemt/)) { tx_acc+=$2; rx_acc+=$3 } }
+                END {
+                    tot_tx_m = (tx_live + tx_acc) / 1048576; tot_rx_m = (rx_live + rx_acc) / 1048576;
+                    if(tot_tx_m > 1024) { tx_s = sprintf("%.2f GB", tot_tx_m/1024) } else { tx_s = sprintf("%.2f MB", tot_tx_m) }
+                    if(tot_rx_m > 1024) { rx_s = sprintf("%.2f GB", tot_rx_m/1024) } else { rx_s = sprintf("%.2f MB", tot_rx_m) }
+                    upt_d = int(upt/86400); upt_h = int((upt%86400)/3600); upt_m = int((upt%3600)/60);
+                    printf "%s|%s|%d|%d|%dd %dh %dm", tx_s, rx_s, act, dp, upt_d, upt_h, upt_m
+                }'
+            local parsed=$(printf "LIVE_MARKER\n%s\nACC_MARKER\n%s" "${r_live}" "${acc_stats}" | awk "$awk_script")
+
+            local s_dl_tot=$(echo "$parsed"|cut -d'|' -f1)
+            local s_ul_tot=$(echo "$parsed"|cut -d'|' -f2)
+            local s_act=$(echo "$parsed"|cut -d'|' -f3)
+            local s_dpi=$(echo "$parsed"|cut -d'|' -f4)
+            local s_upt=$(echo "$parsed"|cut -d'|' -f5)
+
+            local total_cfg_u=$(uci show telemt | grep -c '=user')
+            local frozen_u=$(uci show telemt | grep '\.disabled=' | grep -iE '1|on|true' | wc -l)
+            local active_u=$((total_cfg_u - frozen_u))
+
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}\n\n${E_CPU} <b>CPU Load (1/5/15m):</b> ${loadavg}\n${E_RAM} <b>RAM (Free / Telemt):</b> ${free_ram} MB / ${proc_ram} MB\n\n${E_TRAF} <b>Total Traffic:</b>\n${E_DWN} DL: ${s_dl_tot} | ${E_UP} UL: ${s_ul_tot}\n${E_USR} <b>Users Online:</b> ${s_act} / ${active_u} active\n${E_SHLD} <b>DPI Probes:</b> ${s_dpi}"
+        else
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> 0d 0h 0m"
+        fi
+
+        # Route health indicator
+        local route_icon="${E_OK}"
+        [ "$LAST_ROUTE" = "direct" ] && route_icon="${E_WARN}"
+        [ "$LAST_ROUTE" = "emergency" ] && route_icon="${E_ERR}"
+        [ "$LAST_ROUTE" = "none" ] && route_icon="${E_ERR}"
+
+        local out="${E_STAT} <b>System Status [${host_name}]</b>\n\n${s_icon} <b>Service:</b> ${p_status}\n${E_OS} <b>OS:</b> ${os_ver}\n${E_VER} <b>Core:</b> ${core_ver} | <b>UI:</b> ${web_ver}\n${E_GLOB} <b>WAN IP:</b> ${wan_ip}\n${E_SHLD} <b>Bot Route:</b> ${route_icon} ${LAST_ROUTE} (${proxy_info})"
+        [ -n "$ip_str" ] && out="${out}\n${E_NET} ${ip_str}"
+        out="${out}${stat_out}"
+
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_FILE} Get TOML\",\"callback_data\":\"cmd_get_toml\"},{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_log\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "$out" "$kb"
+        ;;
+
+    # ── Middle Proxy ──
+    "cmd_middle_proxy")
+        local mp=$(uci -q get telemt.general.use_middle_proxy | awk '{print tolower($1)}')
+        local st="${E_ERR} DISABLED"; local t_btn="${E_OK} Enable"
+        if [ "$mp" = "1" ] || [ "$mp" = "true" ] || [ "$mp" = "on" ]; then st="${E_OK} ENABLED"; t_btn="${E_ERR} Disable"; fi
+        local out="${E_SHLD} <b>Telegram Middle Proxy</b>\n\n<b>Status:</b> ${st}\n\n<i>Note: Toggling this enables/disables Middle Proxy routing AND STUN probing simultaneously. Press Apply to restart proxy.</i>"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"mp_toggle\"}],[{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_mp\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
+        send_message "$out" "$kb"
+        ;;
+
+    "mp_toggle")
+        local mp=$(uci -q get telemt.general.use_middle_proxy | awk '{print tolower($1)}')
+        if [ "$mp" = "1" ] || [ "$mp" = "true" ] || [ "$mp" = "on" ]; then
+            uci_safe set telemt.general.use_middle_proxy='0'; uci_safe set telemt.network.stun_tcp_fallback='0'
+        else
+            uci_safe set telemt.general.use_middle_proxy='1'; uci_safe set telemt.network.stun_tcp_fallback='1'
+        fi
+        uci_safe_commit; handle_command "cmd_middle_proxy"
+        ;;
+
+    # ── Users list ──
+    "cmd_users"|"/users")
+        local u_list="${E_USR} <b>Configured Users:</b>\n\n"
+        local kb_buttons="" is_first=1
+        for user in $(uci show telemt | grep '=user' | cut -d. -f2 | cut -d= -f1); do
+            local quota=$(uci -q get "telemt.${user}.data_quota" | tr -d '"')
+            local q_str="${E_INF}"; [ -n "$quota" ] && [ "$quota" != "unlimited" ] && q_str="${quota} GB"
+            local exp_date=$(uci -q get "telemt.${user}.expire_date" | tr -d '"')
+            local status_icon="${E_OK}"
+            if [ -n "$exp_date" ] && [ "$exp_date" != "unlimited" ]; then
+                local exp_epoch=$(date -d "$(echo "$exp_date" | awk -F'[. :]' 'NF==5 {printf "%04d-%02d-%02d %02d:%02d:00", $3,$2,$1,$4,$5}')" +%s 2>/dev/null)
+                local now_epoch=$(date +%s)
+                [ -n "$exp_epoch" ] && [ "$now_epoch" -ge "$exp_epoch" ] && status_icon="${E_ERR}"
+            fi
+            local disabled=$(uci -q get "telemt.${user}.disabled" | awk '{print tolower($1)}')
+            if [ "$disabled" = "1" ] || [ "$disabled" = "true" ] || [ "$disabled" = "on" ]; then status_icon="${E_FRZ}"; fi
+            u_list="${u_list}${status_icon} <b>${user}</b> (Quota: ${q_str})\n"
+            [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
+            kb_buttons="${kb_buttons}[{\"text\":\"${E_SET} ${user}\",\"callback_data\":\"user_manage_${user}\"}]"
+        done
+        [ "$(uci show telemt | grep -c '=user')" -eq 0 ] && u_list="No users configured."
+        local kb="{\"inline_keyboard\":[${kb_buttons}"
+        [ "$is_first" = "0" ] && kb="${kb},"
+        kb="${kb}[{\"text\":\"${E_ADD} Add User\",\"callback_data\":\"cmd_add_user\"},{\"text\":\"${E_CSV} Get CSV\",\"callback_data\":\"cmd_get_csv\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "$u_list" "$kb"
+        ;;
+
+    "cmd_get_csv")
+        send_message "Generating users.csv..."
+        local csv="/tmp/telemt_users.csv"
+        echo "username,secret,max_tcp_conns,max_unique_ips,data_quota,expire_date" > "$csv"
+        for u in $(uci show telemt | grep '=user' | cut -d. -f2 | cut -d= -f1); do
+            printf "%s,%s,%s,%s,%s,%s\n" "$u" \
+                "$(uci -q get telemt.$u.secret)" \
+                "$(uci -q get telemt.$u.max_tcp_conns)" \
+                "$(uci -q get telemt.$u.max_unique_ips)" \
+                "$(uci -q get telemt.$u.data_quota)" \
+                "$(uci -q get telemt.$u.expire_date)" >> "$csv"
+        done
+        send_document "$csv" "Backup of your users list (CSV format)"; rm -f "$csv"
+        ;;
+
+    # ── Upstreams ──
+    "cmd_upstreams"|"/upstreams")
+        local up_list="${E_GLOB} <b>Upstream Proxies:</b>\n\n"
+        local kb_buttons="" ups_found=0 is_first=1
+        for up in $(uci show telemt | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+            ups_found=$((ups_found + 1))
+            local type=$(uci -q get "telemt.${up}.type" || echo "direct")
+            local addr=$(uci -q get "telemt.${up}.address" | tr -d '"' || echo "-")
+            local en=$(uci -q get "telemt.${up}.enabled" | awk '{print tolower($1)}'); [ -z "$en" ] && en="1"
+            local icon="${E_OK}"
+            [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ] && icon="${E_ERR}"
+            up_list="${up_list}${icon} <b>#${ups_found}:</b> ${type}\n<code>${addr}</code>\n\n"
+            [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
+            kb_buttons="${kb_buttons}[{\"text\":\"${E_SET} ${type} (${addr})\",\"callback_data\":\"up_manage_${up}\"}]"
+        done
+        [ "$ups_found" -eq 0 ] && up_list="No upstreams configured."
+        local kb="{\"inline_keyboard\":[${kb_buttons}"
+        [ "$is_first" = "0" ] && kb="${kb},"
+        kb="${kb}[{\"text\":\"${E_ADD} Add Proxy\",\"callback_data\":\"cmd_up_add\"},{\"text\":\"${E_ERR} Disable All\",\"callback_data\":\"cmd_up_disable_all\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "$up_list" "$kb"
+        ;;
+
+    "cmd_up_disable_all")
+        for up in $(uci show telemt | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+            uci_safe set "telemt.${up}.enabled=0"
+        done
+        uci_safe_commit; /etc/init.d/telemt restart; handle_command "cmd_upstreams"
+        ;;
+
+    "cmd_up_add")
+        local n="up_$(awk 'BEGIN{srand(); printf "%04x", rand()*65535}')"
+        uci_safe set "telemt.${n}=upstream"
+        uci_safe set "telemt.${n}.type=socks5"
+        uci_safe set "telemt.${n}.address=127.0.0.1:1080"
+        uci_safe set "telemt.${n}.enabled=0"
+        uci_safe_commit; /etc/init.d/telemt restart; handle_command "up_manage_${n}"
+        ;;
+
+    up_manage_*)
+        local u="${cmd#up_manage_}"
+        [ "$(uci -q get "telemt.${u}")" != "upstream" ] && return
+        local t=$(uci -q get "telemt.${u}.type" || echo "socks5")
+        local a=$(uci -q get "telemt.${u}.address" || echo "-")
+        local en=$(uci -q get "telemt.${u}.enabled" | awk '{print tolower($1)}'); [ -z "$en" ] && en="1"
+        local st="${E_OK} ENABLED"; local t_btn="${E_ERR} Disable"
+        if [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ]; then
+            st="${E_ERR} DISABLED"; t_btn="${E_OK} Enable"; fi
+        local out="${E_GLOB} <b>Upstream Proxy Settings</b>\n\n<b>Type:</b> ${t}\n<b>Address:</b> <code>${a}</code>\n<b>Status:</b> ${st}\n\n<i>Note: Use Apply button to activate changes.</i>"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${E_EDIT} Edit Addr\",\"callback_data\":\"up_edit_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_upstreams\"}]]}"
+        send_message "$out" "$kb"
+        ;;
+
+    up_toggle_*)
+        local u="${cmd#up_toggle_}"
+        local cur=$(uci -q get "telemt.${u}.enabled" | awk '{print tolower($1)}'); [ -z "$cur" ] && cur="1"
+        if [ "$cur" = "1" ] || [ "$cur" = "on" ] || [ "$cur" = "true" ]; then
+            uci_safe set "telemt.${u}.enabled=0"
+        else uci_safe set "telemt.${u}.enabled=1"; fi
+        uci_safe_commit; handle_command "up_manage_${u}"
+        ;;
+
+    up_edit_*)
+        echo "upedit_${cmd#up_edit_}" > "$STATE_FILE"
+        send_message "${E_EDIT} Enter new proxy address (<code>IP:PORT</code>):"
+        ;;
+
+    up_del_confirm_*)
+        local u="${cmd#up_del_confirm_}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_DEL} YES, DELETE\",\"callback_data\":\"up_del_do_${u}\"}],[{\"text\":\"CANCEL\",\"callback_data\":\"up_manage_${u}\"}]]}"
+        send_message "${E_ERR} Are you sure?" "$kb"
+        ;;
+
+    up_del_do_*)
+        uci_safe delete "telemt.${cmd#up_del_do_}"
+        uci_safe_commit; /etc/init.d/telemt restart; handle_command "cmd_upstreams"
+        ;;
+
+    # ── Logs & config ──
+    "cmd_log")
+        logread | grep -i 'telemt' | tail -n 100 > /tmp/telemt_syslog.txt
+        send_document "/tmp/telemt_syslog.txt" "Logs"; rm -f /tmp/telemt_syslog.txt
+        ;;
+    "cmd_get_toml") send_document "/var/etc/telemt.toml" "Config" ;;
+
+    # ── Stop / Restart ──
+    "cmd_stop")
+        uci_safe set telemt.general.enabled='0'; uci_safe_commit
+        /etc/init.d/telemt stop; sleep 1
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "<b>${E_STP} STOPPED</b>" "$kb"
+        ;;
+    "cmd_restart")
+        uci_safe set telemt.general.enabled='1'; uci_safe_commit
+        /etc/init.d/telemt restart; sleep 2
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "<b>${E_OK} RESTARTED</b>" "$kb"
+        ;;
+
+    cmd_restart_stay_mp)
+        uci_safe_commit; /etc/init.d/telemt restart; sleep 1
+        send_message "${E_OK} Applied!"; handle_command "cmd_middle_proxy"
+        ;;
+    cmd_restart_stay_user_*)
+        local u="${cmd#cmd_restart_stay_user_}"
+        uci_safe_commit; /etc/init.d/telemt restart; sleep 1
+        send_message "${E_OK} Applied!"; handle_command "user_manage_${u}"
+        ;;
+    cmd_restart_stay_up_*)
+        local u="${cmd#cmd_restart_stay_up_}"
+        uci_safe_commit; /etc/init.d/telemt restart; sleep 1
+        send_message "${E_OK} Applied!"; handle_command "up_manage_${u}"
+        ;;
+
+    # ── User management ──
+    user_manage_*)
+        local tgt="${cmd#user_manage_}"
+        [ "$(uci -q get "telemt.${tgt}")" != "user" ] && return
+        local sec=$(uci -q get "telemt.${tgt}.secret" | tr -d '"')
+        local q=$(uci -q get "telemt.${tgt}.data_quota" | tr -d '"')
+        [ "$q" != "${E_INF}" ] && [ -n "$q" ] && q="${q} GB" || q="${E_INF}"
+        local i=$(uci -q get "telemt.${tgt}.max_unique_ips" | tr -d '"'); [ -z "$i" ] && i="${E_INF}"
+        local e=$(uci -q get "telemt.${tgt}.expire_date" | tr -d '"'); [ -z "$e" ] && e="${E_INF}"
+
+        local d=$(uci -q get "telemt.${tgt}.disabled" | awk '{print tolower($1)}')
+        local stat_text="${E_OK} [ACTIVE]"; local fr_t="${E_FRZ} Freeze"
+        if [ "$d" = "1" ] || [ "$d" = "true" ] || [ "$d" = "on" ]; then
+            stat_text="${E_FRZ} [FROZEN]"; fr_t="${E_OK} Unfreeze"; fi
+
+        local warn_txt=""
+        if [ "$e" != "${E_INF}" ]; then
+            local exp_epoch=$(date -d "$(echo "$e" | awk -F'[. :]' 'NF==5 {printf "%04d-%02d-%02d %02d:%02d:00", $3,$2,$1,$4,$5}')" +%s 2>/dev/null)
+            local now_epoch=$(date +%s)
+            if [ -n "$exp_epoch" ]; then
+                if [ "$now_epoch" -ge "$exp_epoch" ]; then stat_text="${E_ERR} [EXPIRED]"
+                else
+                    local diff=$((exp_epoch - now_epoch))
+                    [ "$diff" -le 259200 ] && warn_txt="\n${E_WARN} <b>Warning:</b> Expires in $((diff / 86400)) days!"
+                fi
+            fi
+        fi
+
+        local api_port=$(uci -q get telemt.server.api_listen | cut -d: -f2)
+        [ -z "$api_port" ] && api_port=9091
+        local r_usr=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/users/${tgt}" 2>/dev/null)
+        local usr_conn=$(echo "$r_usr" | jsonfilter -e '@.data.current_connections' 2>/dev/null)
+
+        local out_txrx="" out_conn="0" link=""
+
+        if [ -n "$usr_conn" ]; then
+            local usr_bytes=$(echo "$r_usr" | jsonfilter -e '@.data.total_octets' 2>/dev/null)
+            [ -z "$usr_bytes" ] && usr_bytes="0"
+            out_txrx=$(awk -v b="$usr_bytes" 'BEGIN{if(b>1048576){printf "%.2f MB",b/1048576}else{printf "0 MB"}}')
+            out_conn="$usr_conn"
+            link=$(echo "$r_usr" | jsonfilter -e '@.data.links.tls[0]' 2>/dev/null)
+        else
+            local m_port=$(uci -q get telemt.general.metrics_port || echo 9091)
+            local r_live=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${m_port}/metrics" 2>/dev/null | grep "user=\"${tgt}\"")
+            local acc_tx=$(grep "^${tgt} " /tmp/telemt_stats.txt 2>/dev/null | awk '{print $2}'); [ -z "$acc_tx" ] && acc_tx=0
+            local acc_rx=$(grep "^${tgt} " /tmp/telemt_stats.txt 2>/dev/null | awk '{print $3}'); [ -z "$acc_rx" ] && acc_rx=0
+
+            local awk_user='BEGIN{tx=0;rx=0;c=0} /octets_to_client/{tx+=$2} /octets_from_client/{rx+=$2} /connections_current/{c=$2} /^ACC_MARKER/{tx+=$2;rx+=$3} END{if(tx>1073741824){ts=sprintf("%.2f GB",tx/1073741824)}else{ts=sprintf("%.2f MB",tx/1048576)};if(rx>1073741824){rs=sprintf("%.2f GB",rx/1073741824)}else{rs=sprintf("%.2f MB",rx/1048576)};printf "DL: %s | UL: %s|%d",ts,rs,c}'
+            local parsed_usr=$(printf "%s\nACC_MARKER %s %s" "${r_live}" "${acc_tx}" "${acc_rx}" | awk "$awk_user")
+
+            out_txrx=$(echo "$parsed_usr" | cut -d'|' -f1)
+            out_conn=$(echo "$parsed_usr" | cut -d'|' -f2)
+        fi
+
+        if [ -z "$link" ]; then
+            local e_ip=$(uci -q get telemt.general.external_ip)
+            local e_port=$(uci -q get telemt.general.port || echo "443")
+            link="tg://proxy?server=${e_ip}&port=${e_port}&secret=${sec}"
+        fi
+
+        local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>Max IPs:</b> ${i}\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${out_txrx}\n${E_PRX} Connections: ${out_conn}\n\n${E_LINK} <code>${link}</code>\n\n<i>Note: Use Apply to activate changes.</i>"
+
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_user_${tgt}\"}],[{\"text\":\"${E_BACK} Back to Users\",\"callback_data\":\"cmd_users\"}]]}"
+        send_message "$out" "$kb"
+        ;;
+
+    # ── Quick-set callbacks ──
+    user_q_add_*)
+        local val="${cmd#user_q_add_}"; local add_amt="${val%%_*}"; local tgt="${val#*_}"
+        local cur=$(uci -q get "telemt.${tgt}.data_quota"); [ -z "$cur" ] && cur=0
+        local new_q=$(echo "$cur $add_amt" | awk '{print $1+$2}')
+        uci_safe set "telemt.${tgt}.data_quota=${new_q}"; uci_safe_commit
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+    user_q_clr_*)
+        local tgt="${cmd#user_q_clr_}"
+        uci_safe delete "telemt.${tgt}.data_quota"; uci_safe_commit
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+
+    user_i_set_*)
+        local vt="${cmd#user_i_set_}"; local v=$(echo "$vt"|cut -d'_' -f1); local tgt=$(echo "$vt"|cut -d'_' -f2-)
+        uci_safe set "telemt.${tgt}.max_unique_ips=${v}"; uci_safe_commit
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+    user_i_clr_*)
+        local tgt="${cmd#user_i_clr_}"
+        uci_safe delete "telemt.${tgt}.max_unique_ips"; uci_safe_commit
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+
+    user_exp_add_*)
+        local vt="${cmd#user_exp_add_}"; local p=$(echo "$vt"|cut -d'_' -f1); local tgt=$(echo "$vt"|cut -d'_' -f2-)
+        local as=0
+        [ "$p" = "1d" ] && as=86400; [ "$p" = "1w" ] && as=604800
+        [ "$p" = "1m" ] && as=2592000; [ "$p" = "3m" ] && as=7776000
+        local ep=$(( $(date +%s) + as ))
+        local nd=$(awk -v e="$ep" 'BEGIN{print strftime("%d.%m.%Y %H:%M", e)}' 2>/dev/null)
+        [ -z "$nd" ] || echo "$nd" | grep -q "strftime" && nd=$(date -d "@$ep" +"%d.%m.%Y %H:%M" 2>/dev/null)
+        uci_safe set "telemt.${tgt}.expire_date=${nd}"; uci_safe_commit
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+    user_exp_clr_*)
+        local tgt="${cmd#user_exp_clr_}"
+        uci_safe delete "telemt.${tgt}.expire_date"; uci_safe_commit
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+
+    user_ui_cancel_*)
+        local tgt="${cmd#user_ui_cancel_}"
+        rm -f "$STATE_FILE"; handle_command "user_manage_${tgt}"
+        ;;
+
+    user_set_quota_*)
+        local tgt="${cmd#user_set_quota_}"; echo "quota_${tgt}" > "$STATE_FILE"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"+ 1 GB\",\"callback_data\":\"user_q_add_1_${tgt}\"},{\"text\":\"+ 5 GB\",\"callback_data\":\"user_q_add_5_${tgt}\"}],[{\"text\":\"${E_INF} Unlimited (Clear)\",\"callback_data\":\"user_q_clr_${tgt}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"user_ui_cancel_${tgt}\"}]]}"
+        send_message "${E_STAT} Choose Quota to ADD for <b>${tgt}</b> or type custom absolute value (GB):" "$kb"
+        ;;
+
+    user_set_ips_*)
+        local tgt="${cmd#user_set_ips_}"; echo "ips_${tgt}" > "$STATE_FILE"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"1 IP\",\"callback_data\":\"user_i_set_1_${tgt}\"},{\"text\":\"2 IPs\",\"callback_data\":\"user_i_set_2_${tgt}\"},{\"text\":\"5 IPs\",\"callback_data\":\"user_i_set_5_${tgt}\"}],[{\"text\":\"${E_INF} Unlimited (Clear)\",\"callback_data\":\"user_i_clr_${tgt}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"user_ui_cancel_${tgt}\"}]]}"
+        send_message "${E_GLOB} Choose Max IPs for <b>${tgt}</b> or type custom:" "$kb"
+        ;;
+
+    user_set_expiry_*)
+        local tgt="${cmd#user_set_expiry_}"; echo "expiry_${tgt}" > "$STATE_FILE"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"+1 Day\",\"callback_data\":\"user_exp_add_1d_${tgt}\"},{\"text\":\"+1 Week\",\"callback_data\":\"user_exp_add_1w_${tgt}\"}],[{\"text\":\"+1 Month\",\"callback_data\":\"user_exp_add_1m_${tgt}\"},{\"text\":\"+3 Months\",\"callback_data\":\"user_exp_add_3m_${tgt}\"}],[{\"text\":\"${E_INF} Clear Expiry\",\"callback_data\":\"user_exp_clr_${tgt}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"user_ui_cancel_${tgt}\"}]]}"
+        send_message "${E_CAL} Choose Expiry to ADD for <b>${tgt}</b> or type (DD.MM.YYYY HH:MM):" "$kb"
+        ;;
+
+    user_regen_*)
+        local tgt="${cmd#user_regen_}"
+        uci_safe set "telemt.${tgt}.secret=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c 1-32)"
+        uci_safe_commit; handle_command "user_manage_${tgt}"
+        ;;
+
+    user_rename_*)
+        echo "rename_${cmd#user_rename_}" > "$STATE_FILE"
+        send_message "${E_EDIT} Enter new name for <b>${cmd#user_rename_}</b>:"
+        ;;
+
+    user_freeze_*)
+        local tgt="${cmd#user_freeze_}"
+        local d=$(uci -q get "telemt.${tgt}.disabled" | awk '{print tolower($1)}')
+        if [ "$d" = "1" ] || [ "$d" = "true" ] || [ "$d" = "on" ]; then
+            uci_safe set "telemt.${tgt}.disabled=0"
+        else
+            uci_safe set "telemt.${tgt}.disabled=1"
+        fi
+        uci_safe_commit; handle_command "user_manage_${tgt}"
+        ;;
+
+    user_delete_confirm_*)
+        local tgt="${cmd#user_delete_confirm_}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_DEL} YES, DELETE\",\"callback_data\":\"user_delete_do_${tgt}\"}],[{\"text\":\"${E_BACK} CANCEL\",\"callback_data\":\"user_manage_${tgt}\"}]]}"
+        send_message "${E_ERR} Are you sure you want to delete <b>${tgt}</b>?" "$kb"
+        ;;
+
+    user_delete_do_*)
+        uci_safe delete "telemt.${cmd#user_delete_do_}"
+        uci_safe_commit; /etc/init.d/telemt restart; handle_command "cmd_users"
+        ;;
+
+    cmd_add_user)
+        local n="u_$(awk 'BEGIN{srand(); printf "%04x", rand()*65535}')"
+        uci_safe set "telemt.${n}=user"
+        uci_safe set "telemt.${n}.secret=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c 1-32)"
+        uci_safe_commit; /etc/init.d/telemt restart; handle_command "user_manage_${n}"
+        ;;
+
+    *) ;; # Unknown command — ignore silently
+    esac
+}
+
+# ==============================================================================
+# 6. MAIN LOOP
+# ==============================================================================
+
+cleanup() {
+    logger -t telemt-bot "Shutting down (PID $$)..."
+    [ -n "$HEALTH_PID" ] && kill "$HEALTH_PID" 2>/dev/null
+    rm -f "$STATE_FILE" "$UCI_LOCK" "$HEALTH_STATE_FILE"
+    exit 0
+}
+trap cleanup INT TERM
+
+logger -t telemt-bot "Starting v${BOT_VERSION} Long Polling loop..."
+update_proxy_cache
+start_health_daemon
+
+while true; do
+    response=$(api_poll)
+    [ -z "$response" ] && sleep 2 && continue
+
+    i=0
+    while true; do
+        id=$(echo "$response" | jsonfilter -e "@.result[$i].update_id" 2>/dev/null)
+        [ -z "$id" ] && break
+        OFFSET=$((id + 1))
+
+        chat_id=$(echo "$response" | jsonfilter -e "@.result[$i].message.chat.id" 2>/dev/null)
+        text=$(echo "$response" | jsonfilter -e "@.result[$i].message.text" 2>/dev/null)
+        u_name=$(echo "$response" | jsonfilter -e "@.result[$i].message.from.username" 2>/dev/null)
+        callback_id=""
+
+        if [ -z "$chat_id" ]; then
+            chat_id=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.message.chat.id" 2>/dev/null)
+            text=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.data" 2>/dev/null)
+            callback_id=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.id" 2>/dev/null)
+            u_name=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.from.username" 2>/dev/null)
+        fi
+
+        [ -n "$u_name" ] && u_name="@${u_name}" || u_name="Unknown User"
+
+        if [ "$chat_id" = "$ADMIN_ID" ] && [ -n "$text" ]; then
+            if [ -f "$STATE_FILE" ]; then
+                logger -t telemt-bot "Audit: ${u_name} (ID: ${chat_id}) -> Interactive Input"
+            else
+                logger -t telemt-bot "Audit: ${u_name} (ID: ${chat_id}) -> Cmd: ${text}"
+            fi
+            handle_command "$text"
+            update_proxy_cache
+            if [ -n "$callback_id" ]; then
+                api_request "answerCallbackQuery" "{\"callback_query_id\":\"${callback_id}\"}" >/dev/null
+            fi
+        elif [ -n "$chat_id" ] && [ -n "$text" ]; then
+            logger -t telemt-bot "SECURITY WARNING: Unauthorized access from ${u_name} (ID: ${chat_id}) -> Cmd: ${text}"
+        fi
+
+        i=$((i + 1))
+    done
+done
