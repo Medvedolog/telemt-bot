@@ -1,0 +1,8 @@
+# Force LF everywhere — critical for OpenWrt ash scripts
+* text=auto eol=lf
+
+# Explicitly mark shell scripts
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.lua text eol=lf
