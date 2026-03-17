@@ -111,24 +111,6 @@ api_request() called
        ✗ → ALL TIERS FAILED (logged)
 ```
 
-## LuCI Integration (CBI Patch)
-
-If you have `luci-app-telemt` installed, apply `cbi-lua-patch.lua` to add bot management to the "Telegram Bot" tab. The patch adds:
-
-### CHANGE 1 — Extend AJAX detection (line ~83)
-Add `or http.formvalue("bot_action") or http.formvalue("get_bot_status")` to the `is_ajax` variable.
-
-### CHANGE 2 — Insert AJAX handlers (after line ~120)
-Insert the `bot_action` and `get_bot_status` handlers after the existing `telemt_action` block.
-
-### CHANGE 3 — Replace Bot tab UI (lines ~738-756)
-Replace the minimal 3-field bot tab with the full dashboard including:
-- **Live status** — RUNNING/STOPPED with PID
-- **Memory** — RSS of the bot process
-- **Route indicator** — SOCKS (green) / DIRECT (orange) / UNKNOWN (grey)
-- **Control buttons** — Start / Stop / Restart with visual feedback
-- **Auto-polling** — refreshes every 10s, pauses when tab is hidden
-
 ## Bot Commands (Telegram)
 
 | Command | Description |
