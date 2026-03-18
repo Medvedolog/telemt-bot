@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.20 (Resilient Edge Edition)
+# Version: 3.3.22 (fix4: freeze, emoji, buttons-only users, edit-in-place, 4-page runtime)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -12,7 +12,7 @@
 # ==============================================================================
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="3.3.21"
+BOT_VERSION="3.3.22"
 
 # ──────────────────────────────────────────────
 # 0. UCI Config & Auth
@@ -62,6 +62,7 @@ E_CPU="\u2699\ufe0f"; E_RAM="\ud83d\udcbe"; E_TRAF="\ud83d\udcc8"; E_VER="\ud83d
 E_OS="\ud83d\udc27"; E_NET="\ud83d\udd17"
 E_SCAN="\ud83d\udd0d"; E_PORT="\ud83d\udecf\ufe0f"; E_WGT="\u2696\ufe0f"
 E_OFF="\u26aa"; E_PATH="\ud83d\udee3\ufe0f"; E_EXIT="\ud83d\udeaa"
+E_ON="\ud83d\udfe2"
 
 # ==============================================================================
 # 1. NETWORK LAYER — 3-TIER FAILOVER
@@ -554,7 +555,7 @@ handle_command() {
                     if [ "$(uci -q get "telemt.${new_name}")" = "user" ]; then
                         send_message "${E_ERR} User <b>${new_name}</b> already exists!"; return; fi
                     uci_safe set "telemt.${new_name}=user"
-                    for field in secret data_quota max_unique_ips expire_date disabled max_tcp_conns ad_tag; do
+                    for field in secret enabled data_quota max_unique_ips expire_date max_tcp_conns ad_tag; do
                         local val=$(uci -q get "telemt.${tgt}.${field}")
                         [ -n "$val" ] && uci_safe set "telemt.${new_name}.${field}=${val}"
                     done
@@ -646,8 +647,9 @@ handle_command() {
         if [ -n "$pid" ]; then p_status="RUNNING (PID: $pid)"; s_icon="${E_OK}"; fi
 
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-        local os_ver=$(awk -F"'" '/DISTRIB_DESCRIPTION/ {print $2}' /etc/openwrt_release 2>/dev/null)
-        [ -z "$os_ver" ] && os_ver="OpenWrt"
+        local os_ver=$(awk -F"'" '/DISTRIB_RELEASE/ {print $2}' /etc/openwrt_release 2>/dev/null)
+        [ -z "$os_ver" ] && os_ver="unknown"
+        os_ver="OpenWrt ${os_ver}"
 
         # Use cached versions (refreshed at startup + hourly by health daemon)
         local core_ver="$CACHED_CORE_VER"; [ -z "$core_ver" ] && core_ver="Unknown"
@@ -712,7 +714,7 @@ handle_command() {
             local s_upfail=$(echo "$parsed"|cut -d'|' -f8)
 
             local total_cfg_u=$(uci show telemt | grep -c '=user')
-            local frozen_u=$(uci show telemt | grep '\.disabled=' | grep -iE '1|on|true' | wc -l)
+            local frozen_u=$(uci show telemt | grep '\.enabled=' | grep -x '.*=0' | wc -l)
             local active_u=$((total_cfg_u - frozen_u))
 
             # Compute TG Path and Egress from UCI
@@ -795,7 +797,6 @@ handle_command() {
         local user_live_file=$(mktemp /tmp/tbot_users.XXXXXX)
         fetch_users_live "$user_live_file"
 
-        local u_online="" u_offline="" u_frozen=""
         local kb_on="" kb_off="" kb_frz=""
         local n_on=0 n_off=0 n_frz=0
 
@@ -803,41 +804,28 @@ handle_command() {
             local en=$(uci -q get "telemt.${user}.enabled")
             [ "$en" = "0" ] && {
                 n_frz=$((n_frz + 1))
-                u_frozen="${u_frozen}${E_FRZ} <b>${user}</b> [paused]\n"
                 kb_frz="${kb_frz}{\"text\":\"${E_FRZ} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
                 continue
             }
-
-            local conns=0 ips=0 octets=0
+            local conns=0
             local line=$(grep "^${user}|" "$user_live_file" 2>/dev/null)
-            if [ -n "$line" ]; then
-                conns=$(echo "$line" | cut -d'|' -f2)
-                ips=$(echo "$line" | cut -d'|' -f3)
-                octets=$(echo "$line" | cut -d'|' -f5)
-            fi
-            local traf=$(fmt_traffic "${octets:-0}")
-            local ip_str=""; [ "${ips:-0}" -gt 0 ] 2>/dev/null && ip_str=", ${ips} IP"
+            [ -n "$line" ] && conns=$(echo "$line" | cut -d'|' -f2)
 
             if [ "${conns:-0}" -gt 0 ] 2>/dev/null; then
                 n_on=$((n_on + 1))
-                u_online="${u_online}${E_OK} <b>${user}</b> (${conns} conn${ip_str}) | ${traf}\n"
-                kb_on="${kb_on}{\"text\":\"${E_OK} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
+                kb_on="${kb_on}{\"text\":\"${E_ON} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
             else
                 n_off=$((n_off + 1))
-                u_offline="${u_offline}${E_OFF} ${user} | ${traf}\n"
                 kb_off="${kb_off}{\"text\":\"${E_OFF} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
             fi
         done
         rm -f "$user_live_file"
 
         local total=$((n_on + n_off + n_frz))
-        local u_list="${E_USR} <b>Users (${n_on} online / ${total} total):</b>\n\n"
-        [ -n "$u_online" ] && u_list="${u_list}${u_online}\n"
-        [ -n "$u_offline" ] && u_list="${u_list}${u_offline}\n"
-        [ -n "$u_frozen" ] && u_list="${u_list}${u_frozen}"
+        local u_list="${E_USR} <b>Users (${n_on} online / ${total} total)</b>"
         [ "$total" -eq 0 ] && u_list="${E_USR} No users configured."
 
-        # Build keyboard: 2 buttons per row
+        # Build keyboard: 2 buttons per row (online → offline → frozen)
         local all_btns="${kb_on}${kb_off}${kb_frz}"
         all_btns=$(echo "$all_btns" | sed 's/,$//')
         local kb_rows="" btn_buf="" btn_count=0
@@ -1020,12 +1008,10 @@ handle_command() {
     "cmd_get_toml") send_document "/var/etc/telemt.toml" "Config" ;;
 
     # ── Runtime Info (human-readable diagnostics) ──
-    "cmd_runtime_info")
-        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+    "cmd_runtime_info"|"cmd_rtinfo_1")
         local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
-        local out="${E_SCAN} <b>Runtime Info</b>\n"
+        local out="${E_SCAN} <b>Runtime Info (1/4) — Health</b>\n"
 
-        # Proxy health from Prometheus
         local prom=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
         if [ -n "$prom" ]; then
             local upt=$(echo "$prom" | awk '/^telemt_uptime_seconds /{print $2}')
@@ -1036,7 +1022,6 @@ handle_command() {
             local up_fail=$(echo "$prom" | awk '/^telemt_upstream_connect_fail_total /{print $2}')
             local up_att=$(echo "$prom" | awk '/^telemt_upstream_connect_attempt_total /{print $2}')
             local hs_to=$(echo "$prom" | awk '/^telemt_handshake_timeouts_total /{print $2}')
-
             local u_d=0 u_h=0 u_m=0
             if [ -n "$upt" ]; then
                 u_d=$(awk "BEGIN{print int($upt/86400)}")
@@ -1046,62 +1031,177 @@ handle_command() {
             local rate="100%"
             [ "${up_att:-0}" -gt 0 ] 2>/dev/null && rate=$(awk "BEGIN{printf \"%.0f%%\", ${up_ok:-0}/${up_att}*100}")
 
-            out="${out}\n<b>--- Proxy Health ---</b>"
+            out="${out}\n<b>Proxy Health</b>"
             out="${out}\nUptime: ${u_d}d ${u_h}h ${u_m}m"
             out="${out}\nConnections: ${conn:-0}"
-            out="${out}\nRejected: ${rej:-0}"
-            out="${out}\nHandshake TO: ${hs_to:-0}"
+            out="${out}\nRejected: ${rej:-0} | HS Timeout: ${hs_to:-0}"
             out="${out}\nDPI Tamper: ${dpi:-0}"
-            out="${out}\n\n<b>--- Upstream ---</b>"
-            out="${out}\nAttempts: ${up_att:-0}"
-            out="${out}\nSuccess: ${up_ok:-0} | Fails: ${up_fail:-0}"
+            out="${out}\n\n<b>Upstream Connect</b>"
+            out="${out}\nAttempts: ${up_att:-0} | OK: ${up_ok:-0} | Fail: ${up_fail:-0}"
             out="${out}\nRate: ${rate}"
+            out="${out}\n\n<b>Config</b>"
+            out="${out}\nTG: $(get_tg_path) | Egress: $(get_egress_type)"
+            out="${out}\nPort: $(uci -q get telemt.general.port || echo '8443')"
         else
             out="${out}\n<i>Prometheus unavailable</i>"
         fi
 
-        # Config summary
-        out="${out}\n\n<b>--- Config ---</b>"
-        out="${out}\nME: $(get_tg_path) | Egress: $(get_egress_type)"
-        local proxy_port=$(uci -q get telemt.general.port || echo "8443")
-        out="${out}\nPort: ${proxy_port}"
-
-        # ME quality from API (graceful)
-        local api_me=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/stats/minimal/all" 2>/dev/null)
-        if [ -n "$api_me" ] && echo "$api_me" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
-            local me_en=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.middle_proxy_enabled" 2>/dev/null)
-            if [ "$me_en" = "true" ]; then
-                local alive=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.summary.alive_writers" 2>/dev/null)
-                local req=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.summary.required_writers" 2>/dev/null)
-                local cov=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.summary.coverage_pct" 2>/dev/null)
-                out="${out}\n\n<b>--- ME Pool ---</b>"
-                out="${out}\nWriters: ${alive:-0}/${req:-0}"
-                out="${out}\nCoverage: ${cov:-0}%"
-            fi
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_1\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_2\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
         fi
+        ;;
 
-        # Upstream quality from API
-        local api_up=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/stats/upstreams" 2>/dev/null)
+    "cmd_rtinfo_2")
+        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local out="${E_SCAN} <b>Runtime Info (2/4) — Upstreams</b>\n"
+
+        local api_up=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/upstream_quality" 2>/dev/null)
         if [ -n "$api_up" ] && echo "$api_up" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local cfg=$(echo "$api_up" | jsonfilter -e "@.data.summary.configured_total" 2>/dev/null)
+            local hlth=$(echo "$api_up" | jsonfilter -e "@.data.summary.healthy_total" 2>/dev/null)
+            local uhlth=$(echo "$api_up" | jsonfilter -e "@.data.summary.unhealthy_total" 2>/dev/null)
+            out="${out}\n<b>Summary:</b> ${hlth:-0} healthy / ${cfg:-0} total"
+            [ "${uhlth:-0}" -gt 0 ] 2>/dev/null && out="${out} (${E_ERR} ${uhlth} unhealthy)"
+
+            local ca=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_attempt_total" 2>/dev/null)
+            local cs=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_success_total" 2>/dev/null)
+            local cf=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_fail_total" 2>/dev/null)
+            out="${out}\nAttempts: ${ca:-0} | OK: ${cs:-0} | Fail: ${cf:-0}"
+
             local i=0
-            local has_ups=0
             while true; do
                 local addr=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].address" 2>/dev/null)
                 [ -z "$addr" ] && break
-                if [ "$has_ups" = "0" ]; then
-                    out="${out}\n\n<b>--- Upstreams (API) ---</b>"
-                    has_ups=1
-                fi
-                local hlthy=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].healthy" 2>/dev/null)
-                local fails=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].fails" 2>/dev/null)
+                local kind=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].route_kind" 2>/dev/null)
+                local h=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].healthy" 2>/dev/null)
+                local f=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].fails" 2>/dev/null)
                 local lat=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].effective_latency_ms" 2>/dev/null)
-                local st_icon="${E_OK}"; [ "$hlthy" != "true" ] && st_icon="${E_ERR}"
-                out="${out}\n${st_icon} ${addr} | fails:${fails:-0} | ${lat:-?}ms"
+                local w=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].weight" 2>/dev/null)
+                local ic="${E_ON}"; [ "$h" != "true" ] && ic="${E_ERR}"
+                local lat_str=""; [ -n "$lat" ] && lat_str=$(awk "BEGIN{printf \"%.1f\", $lat}")
+                out="${out}\n${ic} ${kind}://${addr} w:${w:-1}"
+                out="${out}\n   fails:${f:-0} lat:${lat_str:-?}ms"
                 i=$((i + 1))
             done
+        else
+            out="${out}\n<i>API unavailable (enable Control API)</i>"
         fi
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"cmd_rtinfo_1\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_2\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_3\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
+        fi
+        ;;
+
+    "cmd_rtinfo_3")
+        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local out="${E_SCAN} <b>Runtime Info (3/4) — ME / NAT</b>\n"
+
+        local api_me=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/me_quality" 2>/dev/null)
+        if [ -n "$api_me" ] && echo "$api_me" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
+            local idle=$(echo "$api_me" | jsonfilter -e "@.data.counters.idle_close_by_peer_total" 2>/dev/null)
+            local kdf=$(echo "$api_me" | jsonfilter -e "@.data.counters.kdf_drift_total" 2>/dev/null)
+            local reconn_a=$(echo "$api_me" | jsonfilter -e "@.data.counters.reconnect_attempt_total" 2>/dev/null)
+            local reconn_s=$(echo "$api_me" | jsonfilter -e "@.data.counters.reconnect_success_total" 2>/dev/null)
+            out="${out}\n<b>ME Quality</b>"
+            out="${out}\nIdle close: ${idle:-0} | KDF drift: ${kdf:-0}"
+            out="${out}\nReconnect: ${reconn_s:-0}/${reconn_a:-0}"
+
+            local j=0
+            while true; do
+                local dc=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].dc" 2>/dev/null)
+                [ -z "$dc" ] && break
+                local rtt=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].rtt_ema_ms" 2>/dev/null)
+                local aw=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].alive_writers" 2>/dev/null)
+                local rw=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].required_writers" 2>/dev/null)
+                local cov=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].coverage_pct" 2>/dev/null)
+                local rtt_s=""; [ -n "$rtt" ] && rtt_s=$(awk "BEGIN{printf \"%.0f\", $rtt}")
+                out="${out}\nDC${dc}: ${aw:-0}/${rw:-0} writers (${cov:-0}%) ${rtt_s:-?}ms"
+                j=$((j + 1))
+            done
+        else
+            out="${out}\n<b>ME:</b> $(get_tg_path)"
+            [ "$(get_tg_path)" = "Direct-DC" ] && out="${out}\n<i>ME disabled — no pool data</i>"
+        fi
+
+        # NAT/STUN
+        local api_nat=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/nat_stun" 2>/dev/null)
+        if [ -n "$api_nat" ] && echo "$api_nat" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
+            local v4=$(echo "$api_nat" | jsonfilter -e "@.data.reflection.v4.addr" 2>/dev/null)
+            local v6=$(echo "$api_nat" | jsonfilter -e "@.data.reflection.v6.addr" 2>/dev/null)
+            out="${out}\n\n<b>NAT/STUN</b>"
+            [ -n "$v4" ] && out="${out}\nIPv4: ${v4}"
+            [ -n "$v6" ] && out="${out}\nIPv6: ${v6}"
+            [ -z "$v4" ] && [ -z "$v6" ] && out="${out}\nNo reflection data"
+        fi
+
+        # Selftest
+        local api_st=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/me-selftest" 2>/dev/null)
+        if [ -n "$api_st" ] && echo "$api_st" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
+            local kdf_st=$(echo "$api_st" | jsonfilter -e "@.data.kdf.state" 2>/dev/null)
+            local ts_st=$(echo "$api_st" | jsonfilter -e "@.data.timeskew.state" 2>/dev/null)
+            local bnd_st=$(echo "$api_st" | jsonfilter -e "@.data.bnd.addr_state" 2>/dev/null)
+            out="${out}\n\n<b>Selftest</b>"
+            out="${out}\nKDF: ${kdf_st:-?} | TimeSkew: ${ts_st:-?} | BND: ${bnd_st:-?}"
+        fi
+
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"cmd_rtinfo_2\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_3\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_4\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
+        fi
+        ;;
+
+    "cmd_rtinfo_4")
+        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local out="${E_SCAN} <b>Runtime Info (4/4) — System</b>\n"
+
+        local api_sys=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/system/info" 2>/dev/null)
+        if [ -n "$api_sys" ] && echo "$api_sys" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local ver=$(echo "$api_sys" | jsonfilter -e "@.data.version" 2>/dev/null)
+            local arch=$(echo "$api_sys" | jsonfilter -e "@.data.target_arch" 2>/dev/null)
+            local prof=$(echo "$api_sys" | jsonfilter -e "@.data.build_profile" 2>/dev/null)
+            local git=$(echo "$api_sys" | jsonfilter -e "@.data.git_commit" 2>/dev/null)
+            local reloads=$(echo "$api_sys" | jsonfilter -e "@.data.config_reload_count" 2>/dev/null)
+            local cfg_path=$(echo "$api_sys" | jsonfilter -e "@.data.config_path" 2>/dev/null)
+            out="${out}\n<b>Binary</b>"
+            out="${out}\nVersion: ${ver:-?} (${arch:-?})"
+            [ -n "$prof" ] && out="${out}\nBuild: ${prof}"
+            [ -n "$git" ] && out="${out}\nCommit: ${git}"
+            out="${out}\nConfig: ${cfg_path:-?}"
+            out="${out}\nReloads: ${reloads:-0}"
+        else
+            out="${out}\n<i>API unavailable</i>"
+        fi
+
+        local api_g=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/gates" 2>/dev/null)
+        if [ -n "$api_g" ] && echo "$api_g" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local acc=$(echo "$api_g" | jsonfilter -e "@.data.accepting_new_connections" 2>/dev/null)
+            local me_rdy=$(echo "$api_g" | jsonfilter -e "@.data.me_runtime_ready" 2>/dev/null)
+            local startup=$(echo "$api_g" | jsonfilter -e "@.data.startup_status" 2>/dev/null)
+            local stage=$(echo "$api_g" | jsonfilter -e "@.data.startup_stage" 2>/dev/null)
+            local pct=$(echo "$api_g" | jsonfilter -e "@.data.startup_progress_pct" 2>/dev/null)
+            out="${out}\n\n<b>Gates</b>"
+            out="${out}\nAccepting: ${acc:-?} | ME ready: ${me_rdy:-?}"
+            out="${out}\nStartup: ${startup:-?} (${stage:-?})"
+            [ -n "$pct" ] && out="${out}\nProgress: ${pct}%"
+        fi
+
+        local api_init=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/initialization" 2>/dev/null)
+        if [ -n "$api_init" ] && echo "$api_init" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local degraded=$(echo "$api_init" | jsonfilter -e "@.data.degraded" 2>/dev/null)
+            local tmode=$(echo "$api_init" | jsonfilter -e "@.data.transport_mode" 2>/dev/null)
+            out="${out}\n\n<b>Initialization</b>"
+            out="${out}\nTransport: ${tmode:-?} | Degraded: ${degraded:-false}"
+        fi
+
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"cmd_rtinfo_3\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_4\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         if [ -n "$CALLBACK_MSG_ID" ]; then
             edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
         else
@@ -1180,7 +1280,7 @@ handle_command() {
         if [ "$is_frozen" = "1" ]; then
             stat_text="${E_FRZ} [PAUSED]"
         elif [ "$conns" -gt 0 ] 2>/dev/null; then
-            stat_text="${E_OK} ONLINE (${conns} conn)"
+            stat_text="${E_ON} ONLINE (${conns} conn)"
         else
             stat_text="${E_OFF} offline"
         fi
@@ -1215,8 +1315,12 @@ handle_command() {
 
         local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>IPs:</b> ${ip_display} (max: ${max_ips})\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${traf}\n${E_PRX} Connections: ${conns}\n${E_GLOB} Active IPs: ${active_ips}\n\n${E_LINK} <code>${link}</code>\n\n<i>Use Apply to hot-reload config.</i>"
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_apply_stay_user_${tgt}\"}],[{\"text\":\"${E_BACK} Back to Users\",\"callback_data\":\"cmd_users\"}]]}"
-        send_message "$out" "$kb"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_apply_stay_user_${tgt}\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"user_manage_${tgt}\"},{\"text\":\"${E_BACK} Users\",\"callback_data\":\"cmd_users\"}]]}"
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
+        fi
         ;;
 
     # ── Quick-set callbacks ──
@@ -1286,8 +1390,11 @@ handle_command() {
 
     user_regen_*)
         local tgt="${cmd#user_regen_}"
-        uci_safe set "telemt.${tgt}.secret=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c 1-32)"
-        uci_safe_commit; handle_command "user_manage_${tgt}"
+        local new_sec=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c 1-32)
+        uci_safe set "telemt.${tgt}.secret=${new_sec}"
+        uci_safe_commit
+        send_message "${E_WARN} Secret regenerated for <b>${tgt}</b>!\nOld links will stop working after Apply."
+        handle_command "user_manage_${tgt}"
         ;;
 
     user_rename_*)
@@ -1297,11 +1404,11 @@ handle_command() {
 
     user_freeze_*)
         local tgt="${cmd#user_freeze_}"
-        local d=$(uci -q get "telemt.${tgt}.disabled" | awk '{print tolower($1)}')
-        if [ "$d" = "1" ] || [ "$d" = "true" ] || [ "$d" = "on" ]; then
-            uci_safe set "telemt.${tgt}.disabled=0"
+        local en=$(uci -q get "telemt.${tgt}.enabled")
+        if [ "$en" = "0" ]; then
+            uci_safe set "telemt.${tgt}.enabled=1"
         else
-            uci_safe set "telemt.${tgt}.disabled=1"
+            uci_safe set "telemt.${tgt}.enabled=0"
         fi
         uci_safe_commit; handle_command "user_manage_${tgt}"
         ;;
