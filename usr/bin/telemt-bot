@@ -148,9 +148,16 @@ is_me_on() {
     [ "$(uci -q get telemt.general.use_middle_proxy)" = "1" ]
 }
 
-# Check if beobachten forensic observation is enabled
+# Check if beobachten forensic observation is available (probe endpoint, not just UCI)
+# Result cached for current handler invocation
+_BEOB_CACHED=""
 is_beob_on() {
-    [ "$(uci -q get telemt.general.beobachten)" = "1" ]
+    if [ -z "$_BEOB_CACHED" ]; then
+        local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+        local probe=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${m_port}/beobachten" 2>/dev/null)
+        [ -n "$probe" ] && [ "$(echo "$probe" | wc -c)" -gt 5 ] && _BEOB_CACHED="yes" || _BEOB_CACHED="no"
+    fi
+    [ "$_BEOB_CACHED" = "yes" ]
 }
 
 # Total runtime info pages
@@ -568,6 +575,7 @@ start_health_daemon() {
 
 handle_command() {
     local cmd="$1"
+    _BEOB_CACHED=""  # reset per-command probe cache
 
     # ── State machine: interactive text input ──
     if [ -f "$STATE_FILE" ]; then
@@ -775,7 +783,7 @@ handle_command() {
             fi
             local port_icon="${E_ERR}"; [ "$port_open" = "open" ] && port_icon="${E_OK}"
 
-            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}\n${E_PRF} <b>Bot Uptime:</b> ${bot_upt_str}"
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}"
             stat_out="${stat_out}\n${E_PATH} <b>TG Path:</b> ${tg_path} | <b>Egress:</b> ${egress_type}"
             [ "$up_total" -gt 0 ] && stat_out="${stat_out}\n${E_GLOB} <b>Upstream:</b> ${up_healthy}/${up_total} (ok: ${s_upok}, fail: ${s_upfail})"
             stat_out="${stat_out}\n${E_PORT} <b>Port:</b> ${proxy_port} (${port_open})"
@@ -784,7 +792,7 @@ handle_command() {
             stat_out="${stat_out}\n${E_USR} <b>Users Online:</b> ${s_act} / ${active_u} active"
             stat_out="${stat_out}\n${E_SCAN} <b>DPI Tamper:</b> ${s_dpi} | <b>Rejected:</b> ${s_rej}"
         else
-            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> 0d 0h 0m\n${E_PRF} <b>Bot Uptime:</b> ${bot_upt_str}"
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> 0d 0h 0m"
         fi
 
         local route_icon="${E_SHLD}"
@@ -801,11 +809,6 @@ handle_command() {
             emergency) route_display="EMERGENCY" ;;
             none) route_display="NOT CONNECTED" ;;
         esac
-
-        # Bot uptime
-        local bot_upt_s=$(( $(date +%s) - ${BOT_START_EPOCH:-$(date +%s)} ))
-        local bot_upt_d=$((bot_upt_s / 86400)) bot_upt_h=$(( (bot_upt_s % 86400) / 3600 )) bot_upt_m=$(( (bot_upt_s % 3600) / 60 ))
-        local bot_upt_str="${bot_upt_d}d ${bot_upt_h}h ${bot_upt_m}m"
 
         local out="${E_STAT} <b>System Status [${host_name}]</b>\n\n${s_icon} <b>Service:</b> ${p_status}\n${E_OS} <b>OS:</b> ${os_ver}\n${E_VER} <b>Core:</b> ${core_ver} | <b>UI:</b> ${web_ver} | <b>Bot:</b> ${BOT_VERSION}\n${E_GLOB} <b>WAN IP:</b> ${wan_ip}\n${route_icon} <b>Bot Route:</b> ${route_display}"
         [ -n "$ip_str" ] && out="${out}\n${E_NET} ${ip_str}"
@@ -1374,19 +1377,34 @@ handle_command() {
         local tp=$(rtinfo_pages)
 
         local out="${E_SCAN} <b>Runtime (${tp}/${tp}) — Beobachten</b>\n"
-        out="${out}\n<i>Forensic observation / scanner tracking</i>\n"
+        out="${out}\n<i>Active DPI scanners &amp; probes</i>\n"
 
         local beob_data=$(api_local "$m_port" "beobachten")
         if [ -n "$beob_data" ] && [ "$(echo "$beob_data" | wc -c)" -gt 10 ]; then
-            # Beobachten returns plain text with IP forensic data
-            local line_count=$(echo "$beob_data" | wc -l)
-            out="${out}\n<b>Active entries:</b> ${line_count}"
-            # Show first 15 lines (avoid Telegram message limit)
-            local preview=$(echo "$beob_data" | head -15 | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
-            out="${out}\n<pre>${preview}</pre>"
-            [ "$line_count" -gt 15 ] && out="${out}\n<i>... and $((line_count - 15)) more entries</i>"
+            # Parse format: [category] ip-count ip-count ... [category] ip-count ...
+            local formatted=$(echo "$beob_data" | awk '{
+                for(i=1;i<=NF;i++) {
+                    if($i ~ /^\[/) {
+                        # Category header: [TLS-scanner] -> TLS Scanner
+                        cat=$i;
+                        for(j=i+1;j<=NF;j++){
+                            if($j ~ /^\[/) break;
+                            cat=cat" "$j;
+                        }
+                        gsub(/[\[\]]/, "", $i);
+                        gsub(/-/, " ", $i);
+                        printf "\n<b>%s</b>\n", $i;
+                    } else if($i ~ /^[0-9].*-[0-9]+$/) {
+                        split($i, a, "-");
+                        printf "  %s — %s hits\n", a[1], a[2];
+                        n++;
+                        if(n>20){printf "  ... (truncated)\n"; exit}
+                    }
+                }
+            }')
+            out="${out}${formatted}"
         else
-            out="${out}\n<i>No scanner activity detected or beobachten endpoint unavailable.</i>"
+            out="${out}\n<i>No scanner activity or beobachten disabled.</i>"
         fi
 
         local prv="cmd_rtinfo_sys"
@@ -1448,7 +1466,7 @@ handle_command() {
         if [ "$en" = "0" ]; then is_frozen=1; fr_t="${E_OK} Unfreeze"; fi
 
         # Fetch live stats from API (graceful: works without API too)
-        local conns=0 active_ips=0 octets=0 link=""
+        local conns=0 active_ips=0 octets=0 link="" ip_list=""
         local r_usr=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_API_PORT}/v1/users/${tgt}" 2>/dev/null)
         if [ -n "$r_usr" ] && echo "$r_usr" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             conns=$(echo "$r_usr" | jsonfilter -e "@.data.current_connections" 2>/dev/null)
@@ -1458,6 +1476,16 @@ handle_command() {
             [ -z "$conns" ] && conns=0
             [ -z "$active_ips" ] && active_ips=0
             [ -z "$octets" ] && octets=0
+            # Extract actual IP addresses
+            local _ip_idx=0
+            while true; do
+                local _ip=$(echo "$r_usr" | jsonfilter -e "@.data.active_unique_ips_list[$_ip_idx]" 2>/dev/null)
+                [ -z "$_ip" ] && break
+                [ -n "$ip_list" ] && ip_list="${ip_list}, "
+                ip_list="${ip_list}${_ip}"
+                _ip_idx=$((_ip_idx + 1))
+                [ "$_ip_idx" -ge 10 ] && { ip_list="${ip_list}..."; break; }
+            done
         else
             # Fallback: Prometheus metrics
             local r_live=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_METRICS_PORT}/metrics" 2>/dev/null | grep "user=\"${tgt}\"")
@@ -1507,7 +1535,10 @@ handle_command() {
             link="tg://proxy?server=${e_ip}&port=${e_port}&secret=${sec}"
         fi
 
-        local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>IPs:</b> ${ip_display} (max: ${max_ips})\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${traf}\n${E_PRX} Connections: ${conns}\n${E_GLOB} Active IPs: ${active_ips}\n\n${E_LINK} <code>${link}</code>\n\n<i>Use Apply to hot-reload config.</i>"
+        local ip_line=""
+        [ -n "$ip_list" ] && ip_line="\n   <code>${ip_list}</code>"
+
+        local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>IPs:</b> ${ip_display} (max: ${max_ips})\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${traf}\n${E_PRX} Connections: ${conns}\n${E_GLOB} Active IPs: ${active_ips}${ip_line}\n\n${E_LINK} <code>${link}</code>\n\n<i>Use Apply to hot-reload config.</i>"
 
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_apply_stay_user_${tgt}\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"user_manage_${tgt}\"},{\"text\":\"${E_BACK} Users\",\"callback_data\":\"cmd_users\"}]]}"
         if [ -n "$CALLBACK_MSG_ID" ]; then
@@ -1664,7 +1695,8 @@ logger -t telemt-bot "Polling: ${LAST_ROUTE} | Health PID: ${HEALTH_PID:-?}"
 _ts=$(date '+%H:%M')
 _proxy_st="STOPPED"; pidof telemt >/dev/null 2>&1 && _proxy_st="RUNNING"
 _ucnt=$(uci show telemt 2>/dev/null | grep -c '=user')
-send_message "${E_PRF} <b>telemt-bot v${BOT_VERSION}</b> started\n${E_SET} ${_ts} | Route: <b>${LAST_ROUTE}</b>\n${E_STAT} Proxy: ${_proxy_st} | Users: ${_ucnt}"
+_kb_start="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Main Menu\",\"callback_data\":\"/menu\"}]]}"
+send_message "${E_PRF} <b>telemt-bot v${BOT_VERSION}</b> started\n${E_SET} ${_ts} | Route: <b>${LAST_ROUTE}</b>\n${E_STAT} Proxy: ${_proxy_st} | Configured users: ${_ucnt}" "$_kb_start"
 
 while true; do
     response=$(api_poll)
