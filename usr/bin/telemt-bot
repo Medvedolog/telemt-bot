@@ -73,16 +73,14 @@ WAN_IP_FILE="/tmp/telemt_bot_wan_ip"
 
 refresh_wan_ip() {
     local ip=""
-    # Tier 1: via SOCKS (router may have no direct internet)
-    if [ -n "$CACHED_PROXY" ] && command -v curl >/dev/null 2>&1; then
-        ip=$(curl -s -k --connect-timeout 3 --max-time 5 -x "$CACHED_PROXY" \
-            "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
-        [ -z "$ip" ] && ip=$(curl -s -k --connect-timeout 3 --max-time 5 -x "$CACHED_PROXY" \
-            "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
+    # WAN IP must be detected WITHOUT SOCKS — we need the router's own public IP,
+    # not the exit IP of the upstream proxy server.
+    ip=$(uclient-fetch -q -O - --timeout=5 "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
+    [ -z "$ip" ] && ip=$(uclient-fetch -q -O - --timeout=5 "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
+    # Tier 2: curl direct (no -x proxy flag)
+    if [ -z "$ip" ] && command -v curl >/dev/null 2>&1; then
+        ip=$(curl -s --connect-timeout 5 --max-time 8 "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
     fi
-    # Tier 2: direct
-    [ -z "$ip" ] && ip=$(uclient-fetch -q -O - --timeout=3 "https://ipv4.internet.yandex.net/api/v0/ip" 2>/dev/null | tr -d ' \n"')
-    [ -z "$ip" ] && ip=$(uclient-fetch -q -O - --timeout=3 "https://api.ipify.org" 2>/dev/null | tr -d ' \n"')
     if [ -n "$ip" ]; then
         echo "$ip" > "$WAN_IP_FILE"
     fi
