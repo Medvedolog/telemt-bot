@@ -2,19 +2,26 @@
 # ==============================================================================
 # telemt-bot — Post-install script
 # Handles both scenarios:
-#   A) luci-app-telemt already installed → /etc/config/telemt exists, just enable
-#   B) Headless install (binary only) → must create UCI skeleton first
+#   A) luci-app-telemt already installed -> /etc/config/telemt exists, just enable
+#   B) Headless install (binary only) -> must create UCI skeleton first
+# SAFETY: Kills any zombie bot processes from previous versions before starting.
 # ==============================================================================
 
 chmod +x /usr/bin/telemt-bot 2>/dev/null
 chmod +x /etc/init.d/telemt-bot 2>/dev/null
 
+# ─── Kill any zombie bot processes from previous install/upgrade ───
+# Use SIGKILL to bypass any buggy trap handlers in old versions.
+for p in $(pgrep -f "/usr/bin/telemt-bot" 2>/dev/null); do
+    kill -KILL "$p" 2>/dev/null
+done
+sleep 1
+
 # ─── Ensure /etc/config/telemt exists with at least a [general] section ───
-# Without this file, ALL uci commands fail — including user's own uci set.
 UCI_CONF="/etc/config/telemt"
 
 if [ ! -f "$UCI_CONF" ]; then
-    logger -t telemt-bot "postinst: UCI config missing — creating minimal skeleton for headless mode"
+    logger -t telemt-bot "postinst: UCI config missing — creating minimal skeleton"
     cat > "$UCI_CONF" <<'EOF'
 config telemt 'general'
 	option enabled '0'

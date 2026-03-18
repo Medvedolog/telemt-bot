@@ -1,11 +1,31 @@
 #!/bin/sh
 # ==============================================================================
 # telemt-bot — Pre-remove script
-# Stop service, disable autostart.
+# CRITICAL: Must kill bot process with SIGKILL to bypass any buggy trap handlers.
+# Old versions had 'kill 0' in cleanup() that rebooted the router.
+# SIGKILL cannot be trapped, so we bypass the entire cleanup mechanism.
 # Does NOT touch /etc/config/telemt — shared with luci-app-telemt and init.d.
 # ==============================================================================
 
-/etc/init.d/telemt-bot stop 2>/dev/null
+PROG="/usr/bin/telemt-bot"
+
+# Step 1: Kill all bot processes with SIGKILL (bypasses trap entirely)
+for p in $(pgrep -f "$PROG" 2>/dev/null); do
+    kill -KILL "$p" 2>/dev/null
+done
+sleep 1
+
+# Step 2: Kill any surviving children (curl, sleep, health daemon)
+for p in $(pgrep -f "$PROG" 2>/dev/null); do
+    kill -KILL "$p" 2>/dev/null
+done
+
+# Step 3: Deregister from procd (process already dead, no trap can fire)
 /etc/init.d/telemt-bot disable 2>/dev/null
 
+# Step 4: Cleanup temp files
+rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock
+rm -f /tmp/telemt_bot_wan_ip /var/run/telemt-bot.pid
+
+logger -t telemt-bot "prerm: Process killed and service disabled."
 exit 0
