@@ -138,6 +138,26 @@ fmt_traffic() {
     awk "BEGIN { m=$1/1048576; if(m>1024) printf \"%.1f GB\",m/1024; else printf \"%.0f MB\",m }"
 }
 
+# Fast localhost API fetch — 1s timeout (localhost responds in <10ms if alive)
+api_local() {
+    uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${1}/${2}" 2>/dev/null
+}
+
+# Check if ME mode is active (from UCI — no API call needed)
+is_me_on() {
+    [ "$(uci -q get telemt.general.use_middle_proxy)" = "1" ]
+}
+
+# Send or edit runtime info page
+rtinfo_send() {
+    local out="$1" kb="$2"
+    if [ -n "$CALLBACK_MSG_ID" ]; then
+        edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+    else
+        send_message "$out" "$kb"
+    fi
+}
+
 # ─── 0e. Version cache (read from init.d cache files — never exec telemt binary) ───
 CACHED_CORE_VER=""
 CACHED_WEB_VER=""
@@ -1007,69 +1027,83 @@ handle_command() {
         ;;
     "cmd_get_toml") send_document "/var/etc/telemt.toml" "Config" ;;
 
-    # ── Runtime Info (human-readable diagnostics) ──
-    "cmd_runtime_info"|"cmd_rtinfo_1")
+    # ── Runtime Info — adaptive pages ──
+    # Pages: Health → Upstreams → [ME if on] → System
+    "cmd_runtime_info"|"cmd_rtinfo_health")
         local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
-        local out="${E_SCAN} <b>Runtime Info (1/4) — Health</b>\n"
+        local a_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local me_on=0; is_me_on && me_on=1
+        local total_p=3; [ "$me_on" = "1" ] && total_p=4
 
-        local prom=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
+        local out="${E_SCAN} <b>Runtime (1/${total_p}) — Health</b>\n"
+        local prom=$(api_local "$m_port" "metrics")
         if [ -n "$prom" ]; then
             local upt=$(echo "$prom" | awk '/^telemt_uptime_seconds /{print $2}')
             local conn=$(echo "$prom" | awk '/^telemt_connections_total /{print $2}')
+            local c_cur=$(echo "$prom" | awk '/^telemt_connections_current /{print $2}')
+            local c_dir=$(echo "$prom" | awk '/^telemt_connections_direct_current /{print $2}')
+            local c_me=$(echo "$prom" | awk '/^telemt_connections_me_current /{print $2}')
             local rej=$(echo "$prom" | awk '/^telemt_connections_bad_total /{print $2}')
             local dpi=$(echo "$prom" | awk '/^telemt_desync_total /{print $2}')
+            local hs_to=$(echo "$prom" | awk '/^telemt_handshake_timeouts_total /{print $2}')
             local up_ok=$(echo "$prom" | awk '/^telemt_upstream_connect_success_total /{print $2}')
             local up_fail=$(echo "$prom" | awk '/^telemt_upstream_connect_fail_total /{print $2}')
             local up_att=$(echo "$prom" | awk '/^telemt_upstream_connect_attempt_total /{print $2}')
-            local hs_to=$(echo "$prom" | awk '/^telemt_handshake_timeouts_total /{print $2}')
+            local inv_pad=$(echo "$prom" | awk '/^telemt_secure_padding_invalid_total /{print $2}')
+            local evict=$(echo "$prom" | awk '/^telemt_reconnect_evict_total /{print $2}')
+
             local u_d=0 u_h=0 u_m=0
-            if [ -n "$upt" ]; then
+            [ -n "$upt" ] && {
                 u_d=$(awk "BEGIN{print int($upt/86400)}")
                 u_h=$(awk "BEGIN{print int(($upt%86400)/3600)}")
                 u_m=$(awk "BEGIN{print int(($upt%3600)/60)}")
-            fi
-            local rate="100%"
+            }
+            local rate="—"
             [ "${up_att:-0}" -gt 0 ] 2>/dev/null && rate=$(awk "BEGIN{printf \"%.0f%%\", ${up_ok:-0}/${up_att}*100}")
 
-            out="${out}\n<b>Proxy Health</b>"
             out="${out}\nUptime: ${u_d}d ${u_h}h ${u_m}m"
-            out="${out}\nConnections: ${conn:-0}"
-            out="${out}\nRejected: ${rej:-0} | HS Timeout: ${hs_to:-0}"
-            out="${out}\nDPI Tamper: ${dpi:-0}"
+            out="${out}\nActive now: <b>${c_cur:-0}</b>"
+            [ "$me_on" = "1" ] && out="${out} (direct: ${c_dir:-0}, ME: ${c_me:-0})"
+            out="${out}\nTotal: ${conn:-0} | Rejected: ${rej:-0}"
+            [ "${hs_to:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} HS Timeout: ${hs_to}"
+            [ "${dpi:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} DPI Tamper: ${dpi}" || out="${out}\nDPI Tamper: 0"
+            [ "${inv_pad:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_ERR} Invalid padding: ${inv_pad}"
+            [ "${evict:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Evicted sessions: ${evict}"
             out="${out}\n\n<b>Upstream Connect</b>"
             out="${out}\nAttempts: ${up_att:-0} | OK: ${up_ok:-0} | Fail: ${up_fail:-0}"
             out="${out}\nRate: ${rate}"
-            out="${out}\n\n<b>Config</b>"
-            out="${out}\nTG: $(get_tg_path) | Egress: $(get_egress_type)"
-            out="${out}\nPort: $(uci -q get telemt.general.port || echo '8443')"
         else
             out="${out}\n<i>Prometheus unavailable</i>"
         fi
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_1\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_2\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        if [ -n "$CALLBACK_MSG_ID" ]; then
-            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
-        else
-            send_message "$out" "$kb"
-        fi
+        local nxt="cmd_rtinfo_ups"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_health\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"${nxt}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rtinfo_send "$out" "$kb"
         ;;
 
-    "cmd_rtinfo_2")
-        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
-        local out="${E_SCAN} <b>Runtime Info (2/4) — Upstreams</b>\n"
+    "cmd_rtinfo_ups")
+        local a_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+        local me_on=0; is_me_on && me_on=1
+        local total_p=3; [ "$me_on" = "1" ] && total_p=4
 
-        local api_up=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/upstream_quality" 2>/dev/null)
+        local out="${E_SCAN} <b>Runtime (2/${total_p}) — Upstreams</b>\n"
+
+        # Try new API first (3.3.22+), then old (3.3.15+), then Prometheus
+        local api_up=$(api_local "$a_port" "v1/runtime/upstream_quality")
         if [ -n "$api_up" ] && echo "$api_up" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             local cfg=$(echo "$api_up" | jsonfilter -e "@.data.summary.configured_total" 2>/dev/null)
             local hlth=$(echo "$api_up" | jsonfilter -e "@.data.summary.healthy_total" 2>/dev/null)
             local uhlth=$(echo "$api_up" | jsonfilter -e "@.data.summary.unhealthy_total" 2>/dev/null)
-            out="${out}\n<b>Summary:</b> ${hlth:-0} healthy / ${cfg:-0} total"
+            out="${out}\n<b>Summary:</b> ${hlth:-?} healthy / ${cfg:-?} total"
             [ "${uhlth:-0}" -gt 0 ] 2>/dev/null && out="${out} (${E_ERR} ${uhlth} unhealthy)"
 
             local ca=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_attempt_total" 2>/dev/null)
             local cs=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_success_total" 2>/dev/null)
             local cf=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_fail_total" 2>/dev/null)
+            local cff=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_failfast_hard_error_total" 2>/dev/null)
             out="${out}\nAttempts: ${ca:-0} | OK: ${cs:-0} | Fail: ${cf:-0}"
+            [ "${cff:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Hard failfast: ${cff}"
 
             local i=0
             while true; do
@@ -1081,36 +1115,71 @@ handle_command() {
                 local lat=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].effective_latency_ms" 2>/dev/null)
                 local w=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].weight" 2>/dev/null)
                 local ic="${E_ON}"; [ "$h" != "true" ] && ic="${E_ERR}"
-                local lat_str=""; [ -n "$lat" ] && lat_str=$(awk "BEGIN{printf \"%.1f\", $lat}")
-                out="${out}\n${ic} ${kind}://${addr} w:${w:-1}"
-                out="${out}\n   fails:${f:-0} lat:${lat_str:-?}ms"
+                local lat_s="—"; [ -n "$lat" ] && lat_s=$(awk "BEGIN{printf \"%.1f\", $lat}")
+                out="${out}\n\n${ic} <b>${kind}://${addr}</b> w:${w:-1}"
+                out="${out}\n   fails:${f:-0} | lat:${lat_s}ms"
                 i=$((i + 1))
             done
         else
-            out="${out}\n<i>API unavailable (enable Control API)</i>"
+            # Fallback: old API (3.3.15+)
+            local api_old=$(api_local "$a_port" "v1/stats/upstreams")
+            if [ -n "$api_old" ] && echo "$api_old" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+                local i=0
+                while true; do
+                    local addr=$(echo "$api_old" | jsonfilter -e "@.data.upstreams[$i].address" 2>/dev/null)
+                    [ -z "$addr" ] && break
+                    local h=$(echo "$api_old" | jsonfilter -e "@.data.upstreams[$i].healthy" 2>/dev/null)
+                    local f=$(echo "$api_old" | jsonfilter -e "@.data.upstreams[$i].fails" 2>/dev/null)
+                    local lat=$(echo "$api_old" | jsonfilter -e "@.data.upstreams[$i].effective_latency_ms" 2>/dev/null)
+                    local ic="${E_ON}"; [ "$h" != "true" ] && ic="${E_ERR}"
+                    local lat_s="—"; [ -n "$lat" ] && lat_s=$(awk "BEGIN{printf \"%.1f\", $lat}")
+                    out="${out}\n${ic} ${addr} | fails:${f:-0} | ${lat_s}ms"
+                    i=$((i + 1))
+                done
+                out="${out}\n\n<i>Detailed view: binary 3.3.22+</i>"
+            else
+                # Fallback: Prometheus only
+                local prom=$(api_local "$m_port" "metrics")
+                local ua=$(echo "$prom" | awk '/^telemt_upstream_connect_attempt_total /{print $2}')
+                local us=$(echo "$prom" | awk '/^telemt_upstream_connect_success_total /{print $2}')
+                local uf=$(echo "$prom" | awk '/^telemt_upstream_connect_fail_total /{print $2}')
+                out="${out}\nAttempts: ${ua:-0} | OK: ${us:-0} | Fail: ${uf:-0}"
+                out="${out}\n\n<i>Per-upstream detail: enable Control API</i>"
+            fi
         fi
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"cmd_rtinfo_1\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_2\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_3\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        if [ -n "$CALLBACK_MSG_ID" ]; then
-            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
-        else
-            send_message "$out" "$kb"
+        # Retry histogram from Prometheus (bonus)
+        local prom_h=$(api_local "$m_port" "metrics")
+        if [ -n "$prom_h" ]; then
+            local b2=$(echo "$prom_h" | awk '/upstream_connect_attempts_per_request\{bucket="2"\}/{print $2}')
+            local b34=$(echo "$prom_h" | awk '/upstream_connect_attempts_per_request\{bucket="3_4"\}/{print $2}')
+            local bgt=$(echo "$prom_h" | awk '/upstream_connect_attempts_per_request\{bucket="gt_4"\}/{print $2}')
+            if [ "${b2:-0}" -gt 0 ] 2>/dev/null || [ "${b34:-0}" -gt 0 ] 2>/dev/null || [ "${bgt:-0}" -gt 0 ] 2>/dev/null; then
+                out="${out}\n\n<b>Retries:</b> 2nd:${b2:-0} 3-4:${b34:-0} >4:${bgt:-0}"
+            fi
         fi
+
+        local prv="cmd_rtinfo_health"
+        local nxt="cmd_rtinfo_sys"; [ "$me_on" = "1" ] && nxt="cmd_rtinfo_me"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_ups\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"${nxt}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rtinfo_send "$out" "$kb"
         ;;
 
-    "cmd_rtinfo_3")
-        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
-        local out="${E_SCAN} <b>Runtime Info (3/4) — ME / NAT</b>\n"
+    "cmd_rtinfo_me")
+        local a_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
 
-        local api_me=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/me_quality" 2>/dev/null)
+        local out="${E_SCAN} <b>Runtime (3/4) — ME Pool</b>\n"
+
+        # Try new API (3.3.22+)
+        local api_me=$(api_local "$a_port" "v1/runtime/me_quality")
         if [ -n "$api_me" ] && echo "$api_me" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
             local idle=$(echo "$api_me" | jsonfilter -e "@.data.counters.idle_close_by_peer_total" 2>/dev/null)
             local kdf=$(echo "$api_me" | jsonfilter -e "@.data.counters.kdf_drift_total" 2>/dev/null)
-            local reconn_a=$(echo "$api_me" | jsonfilter -e "@.data.counters.reconnect_attempt_total" 2>/dev/null)
-            local reconn_s=$(echo "$api_me" | jsonfilter -e "@.data.counters.reconnect_success_total" 2>/dev/null)
-            out="${out}\n<b>ME Quality</b>"
+            local ra=$(echo "$api_me" | jsonfilter -e "@.data.counters.reconnect_attempt_total" 2>/dev/null)
+            local rs=$(echo "$api_me" | jsonfilter -e "@.data.counters.reconnect_success_total" 2>/dev/null)
             out="${out}\nIdle close: ${idle:-0} | KDF drift: ${kdf:-0}"
-            out="${out}\nReconnect: ${reconn_s:-0}/${reconn_a:-0}"
+            out="${out}\nReconnect: ${rs:-0}/${ra:-0}"
 
             local j=0
             while true; do
@@ -1120,49 +1189,61 @@ handle_command() {
                 local aw=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].alive_writers" 2>/dev/null)
                 local rw=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].required_writers" 2>/dev/null)
                 local cov=$(echo "$api_me" | jsonfilter -e "@.data.dc_rtt[$j].coverage_pct" 2>/dev/null)
-                local rtt_s=""; [ -n "$rtt" ] && rtt_s=$(awk "BEGIN{printf \"%.0f\", $rtt}")
-                out="${out}\nDC${dc}: ${aw:-0}/${rw:-0} writers (${cov:-0}%) ${rtt_s:-?}ms"
+                local rtt_s="—"; [ -n "$rtt" ] && rtt_s=$(awk "BEGIN{printf \"%.0f\", $rtt}")
+                local cov_ic=""; [ -n "$cov" ] && [ "$(awk "BEGIN{print ($cov<100)}")" = "1" ] && cov_ic="${E_WARN} "
+                out="${out}\nDC${dc}: ${aw:-0}/${rw:-0} ${cov_ic}(${cov:-?}%) ${rtt_s}ms"
                 j=$((j + 1))
             done
         else
-            out="${out}\n<b>ME:</b> $(get_tg_path)"
-            [ "$(get_tg_path)" = "Direct-DC" ] && out="${out}\n<i>ME disabled — no pool data</i>"
+            # Fallback: Prometheus ME counters
+            local prom=$(api_local "$m_port" "metrics")
+            local mw_act=$(echo "$prom" | awk '/^telemt_me_writers_active_current /{print $2}')
+            local mw_warm=$(echo "$prom" | awk '/^telemt_me_writers_warm_current /{print $2}')
+            local me_ka_to=$(echo "$prom" | awk '/^telemt_me_keepalive_timeout_total /{print $2}')
+            local me_reconn=$(echo "$prom" | awk '/^telemt_me_reconnect_success_total /{print $2}')
+            local me_kdf=$(echo "$prom" | awk '/^telemt_me_kdf_drift_total /{print $2}')
+            out="${out}\nWriters: active=${mw_act:-0} warm=${mw_warm:-0}"
+            [ "${me_ka_to:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Keepalive timeouts: ${me_ka_to}"
+            out="${out}\nReconnects: ${me_reconn:-0} | KDF drift: ${me_kdf:-0}"
+            out="${out}\n\n<i>Per-DC detail: binary 3.3.22+</i>"
         fi
 
         # NAT/STUN
-        local api_nat=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/nat_stun" 2>/dev/null)
+        local api_nat=$(api_local "$a_port" "v1/runtime/nat_stun")
         if [ -n "$api_nat" ] && echo "$api_nat" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
             local v4=$(echo "$api_nat" | jsonfilter -e "@.data.reflection.v4.addr" 2>/dev/null)
             local v6=$(echo "$api_nat" | jsonfilter -e "@.data.reflection.v6.addr" 2>/dev/null)
             out="${out}\n\n<b>NAT/STUN</b>"
             [ -n "$v4" ] && out="${out}\nIPv4: ${v4}"
             [ -n "$v6" ] && out="${out}\nIPv6: ${v6}"
-            [ -z "$v4" ] && [ -z "$v6" ] && out="${out}\nNo reflection data"
+            [ -z "$v4" ] && [ -z "$v6" ] && out="${out}\nNo reflection"
         fi
 
         # Selftest
-        local api_st=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/me-selftest" 2>/dev/null)
+        local api_st=$(api_local "$a_port" "v1/runtime/me-selftest")
         if [ -n "$api_st" ] && echo "$api_st" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
-            local kdf_st=$(echo "$api_st" | jsonfilter -e "@.data.kdf.state" 2>/dev/null)
-            local ts_st=$(echo "$api_st" | jsonfilter -e "@.data.timeskew.state" 2>/dev/null)
-            local bnd_st=$(echo "$api_st" | jsonfilter -e "@.data.bnd.addr_state" 2>/dev/null)
+            local kdf_s=$(echo "$api_st" | jsonfilter -e "@.data.kdf.state" 2>/dev/null)
+            local ts_s=$(echo "$api_st" | jsonfilter -e "@.data.timeskew.state" 2>/dev/null)
+            local bnd_s=$(echo "$api_st" | jsonfilter -e "@.data.bnd.addr_state" 2>/dev/null)
             out="${out}\n\n<b>Selftest</b>"
-            out="${out}\nKDF: ${kdf_st:-?} | TimeSkew: ${ts_st:-?} | BND: ${bnd_st:-?}"
+            out="${out}\nKDF: ${kdf_s:-n/a} | TimeSkew: ${ts_s:-n/a} | BND: ${bnd_s:-n/a}"
         fi
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"cmd_rtinfo_2\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_3\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_4\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        if [ -n "$CALLBACK_MSG_ID" ]; then
-            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
-        else
-            send_message "$out" "$kb"
-        fi
+        local prv="cmd_rtinfo_ups"
+        local nxt="cmd_rtinfo_sys"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_me\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"${nxt}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rtinfo_send "$out" "$kb"
         ;;
 
-    "cmd_rtinfo_4")
-        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
-        local out="${E_SCAN} <b>Runtime Info (4/4) — System</b>\n"
+    "cmd_rtinfo_sys")
+        local a_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local me_on=0; is_me_on && me_on=1
+        local total_p=3; [ "$me_on" = "1" ] && total_p=4
 
-        local api_sys=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/system/info" 2>/dev/null)
+        local out="${E_SCAN} <b>Runtime (${total_p}/${total_p}) — System</b>\n"
+
+        # Try /v1/system/info (3.3.19+)
+        local api_sys=$(api_local "$a_port" "v1/system/info")
         if [ -n "$api_sys" ] && echo "$api_sys" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             local ver=$(echo "$api_sys" | jsonfilter -e "@.data.version" 2>/dev/null)
             local arch=$(echo "$api_sys" | jsonfilter -e "@.data.target_arch" 2>/dev/null)
@@ -1170,45 +1251,51 @@ handle_command() {
             local git=$(echo "$api_sys" | jsonfilter -e "@.data.git_commit" 2>/dev/null)
             local reloads=$(echo "$api_sys" | jsonfilter -e "@.data.config_reload_count" 2>/dev/null)
             local cfg_path=$(echo "$api_sys" | jsonfilter -e "@.data.config_path" 2>/dev/null)
-            out="${out}\n<b>Binary</b>"
-            out="${out}\nVersion: ${ver:-?} (${arch:-?})"
-            [ -n "$prof" ] && out="${out}\nBuild: ${prof}"
+            out="${out}\n<b>Binary:</b> ${ver:-?} (${arch:-?})"
+            [ -n "$prof" ] && [ "$prof" != "unknown" ] && out="${out} [${prof}]"
             [ -n "$git" ] && out="${out}\nCommit: ${git}"
             out="${out}\nConfig: ${cfg_path:-?}"
-            out="${out}\nReloads: ${reloads:-0}"
+            out="${out}\nHot reloads: ${reloads:-0}"
         else
-            out="${out}\n<i>API unavailable</i>"
+            local fver=$(cat /tmp/etc/telemt.version 2>/dev/null || echo "?")
+            out="${out}\n<b>Binary:</b> ${fver}"
+            out="${out}\n<i>System API: binary 3.3.19+</i>"
         fi
 
-        local api_g=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/gates" 2>/dev/null)
+        # Gates (3.3.19+)
+        local api_g=$(api_local "$a_port" "v1/runtime/gates")
         if [ -n "$api_g" ] && echo "$api_g" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             local acc=$(echo "$api_g" | jsonfilter -e "@.data.accepting_new_connections" 2>/dev/null)
-            local me_rdy=$(echo "$api_g" | jsonfilter -e "@.data.me_runtime_ready" 2>/dev/null)
             local startup=$(echo "$api_g" | jsonfilter -e "@.data.startup_status" 2>/dev/null)
-            local stage=$(echo "$api_g" | jsonfilter -e "@.data.startup_stage" 2>/dev/null)
-            local pct=$(echo "$api_g" | jsonfilter -e "@.data.startup_progress_pct" 2>/dev/null)
             out="${out}\n\n<b>Gates</b>"
-            out="${out}\nAccepting: ${acc:-?} | ME ready: ${me_rdy:-?}"
-            out="${out}\nStartup: ${startup:-?} (${stage:-?})"
-            [ -n "$pct" ] && out="${out}\nProgress: ${pct}%"
+            local acc_ic="${E_ON}"; [ "$acc" != "true" ] && acc_ic="${E_ERR}"
+            out="${out}\nAccepting: ${acc_ic} | Startup: ${startup:-?}"
+            if [ "$me_on" = "1" ]; then
+                local me_rdy=$(echo "$api_g" | jsonfilter -e "@.data.me_runtime_ready" 2>/dev/null)
+                local me_ic="${E_ON}"; [ "$me_rdy" != "true" ] && me_ic="${E_ERR}"
+                out="${out}\nME ready: ${me_ic}"
+            fi
         fi
 
-        local api_init=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/runtime/initialization" 2>/dev/null)
-        if [ -n "$api_init" ] && echo "$api_init" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
-            local degraded=$(echo "$api_init" | jsonfilter -e "@.data.degraded" 2>/dev/null)
-            local tmode=$(echo "$api_init" | jsonfilter -e "@.data.transport_mode" 2>/dev/null)
-            out="${out}\n\n<b>Initialization</b>"
-            out="${out}\nTransport: ${tmode:-?} | Degraded: ${degraded:-false}"
+        # Recent events (3.3.22+, optional — single call, no fallback)
+        local api_ev=$(api_local "$a_port" "v1/runtime/events/recent?limit=5")
+        if [ -n "$api_ev" ] && echo "$api_ev" | jsonfilter -e "@.data.events[0].event_type" 2>/dev/null | grep -q "."; then
+            out="${out}\n\n<b>Recent Events</b>"
+            local k=0
+            while [ "$k" -lt 5 ]; do
+                local ev_type=$(echo "$api_ev" | jsonfilter -e "@.data.events[$k].event_type" 2>/dev/null)
+                [ -z "$ev_type" ] && break
+                local ev_ctx=$(echo "$api_ev" | jsonfilter -e "@.data.events[$k].context" 2>/dev/null)
+                [ -n "$ev_ctx" ] && ev_ctx=" — ${ev_ctx}"
+                out="${out}\n- ${ev_type}${ev_ctx}"
+                k=$((k + 1))
+            done
         fi
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"cmd_rtinfo_3\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_4\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        if [ -n "$CALLBACK_MSG_ID" ]; then
-            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
-        else
-            send_message "$out" "$kb"
-        fi
+        local prv="cmd_rtinfo_ups"; [ "$me_on" = "1" ] && prv="cmd_rtinfo_me"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_sys\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rtinfo_send "$out" "$kb"
         ;;
-
     # ── Stop / Restart ──
     "cmd_stop")
         uci_safe set telemt.general.enabled='0'; uci_safe_commit
