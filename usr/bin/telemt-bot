@@ -148,6 +148,16 @@ is_me_on() {
     [ "$(uci -q get telemt.general.use_middle_proxy)" = "1" ]
 }
 
+# Check if beobachten forensic observation is enabled
+is_beob_on() {
+    [ "$(uci -q get telemt.general.beobachten)" = "1" ]
+}
+
+# Total runtime info pages
+rtinfo_pages() {
+    local n=4; is_me_on && n=$((n+1)); is_beob_on && n=$((n+1)); echo $n
+}
+
 # Send or edit runtime info page
 rtinfo_send() {
     local out="$1" kb="$2"
@@ -651,7 +661,9 @@ handle_command() {
 
     # ── Main menu ──
     "/start"|"/menu")
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"}]]}"
+        local _stop_start="{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"}"
+        pidof telemt >/dev/null 2>&1 || _stop_start="{\"text\":\"${E_ON} Start Proxy\",\"callback_data\":\"cmd_start\"}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[${_stop_start}]]}"
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Egress: <b>$(get_egress_type)</b> | TG: <b>$(get_tg_path)</b>\nSelect an action:" "$kb"
         ;;
@@ -763,7 +775,7 @@ handle_command() {
             fi
             local port_icon="${E_ERR}"; [ "$port_open" = "open" ] && port_icon="${E_OK}"
 
-            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}"
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}\n${E_PRF} <b>Bot Uptime:</b> ${bot_upt_str}"
             stat_out="${stat_out}\n${E_PATH} <b>TG Path:</b> ${tg_path} | <b>Egress:</b> ${egress_type}"
             [ "$up_total" -gt 0 ] && stat_out="${stat_out}\n${E_GLOB} <b>Upstream:</b> ${up_healthy}/${up_total} (ok: ${s_upok}, fail: ${s_upfail})"
             stat_out="${stat_out}\n${E_PORT} <b>Port:</b> ${proxy_port} (${port_open})"
@@ -772,15 +784,30 @@ handle_command() {
             stat_out="${stat_out}\n${E_USR} <b>Users Online:</b> ${s_act} / ${active_u} active"
             stat_out="${stat_out}\n${E_SCAN} <b>DPI Tamper:</b> ${s_dpi} | <b>Rejected:</b> ${s_rej}"
         else
-            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> 0d 0h 0m"
+            stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> 0d 0h 0m\n${E_PRF} <b>Bot Uptime:</b> ${bot_upt_str}"
         fi
 
-        local route_icon="${E_OK}"
+        local route_icon="${E_SHLD}"
         [ "$LAST_ROUTE" = "direct" ] && route_icon="${E_WARN}"
         [ "$LAST_ROUTE" = "emergency" ] && route_icon="${E_ERR}"
         [ "$LAST_ROUTE" = "none" ] && route_icon="${E_ERR}"
 
-        local out="${E_STAT} <b>System Status [${host_name}]</b>\n\n${s_icon} <b>Service:</b> ${p_status}\n${E_OS} <b>OS:</b> ${os_ver}\n${E_VER} <b>Core:</b> ${core_ver} | <b>UI:</b> ${web_ver}\n${E_GLOB} <b>WAN IP:</b> ${wan_ip}\n${E_SHLD} <b>Bot Route:</b> ${route_icon} ${LAST_ROUTE} (${proxy_info})"
+        # Clean bot route display
+        local route_display="DIRECT"
+        case "$LAST_ROUTE" in
+            socks) local _px=$(echo "$CACHED_PROXY" | sed 's|socks5h://||;s|socks5://||;s|socks4://||')
+                   route_display="SOCKS5 via ${_px}" ;;
+            direct) route_display="DIRECT (no SOCKS)" ;;
+            emergency) route_display="EMERGENCY" ;;
+            none) route_display="NOT CONNECTED" ;;
+        esac
+
+        # Bot uptime
+        local bot_upt_s=$(( $(date +%s) - ${BOT_START_EPOCH:-$(date +%s)} ))
+        local bot_upt_d=$((bot_upt_s / 86400)) bot_upt_h=$(( (bot_upt_s % 86400) / 3600 )) bot_upt_m=$(( (bot_upt_s % 3600) / 60 ))
+        local bot_upt_str="${bot_upt_d}d ${bot_upt_h}h ${bot_upt_m}m"
+
+        local out="${E_STAT} <b>System Status [${host_name}]</b>\n\n${s_icon} <b>Service:</b> ${p_status}\n${E_OS} <b>OS:</b> ${os_ver}\n${E_VER} <b>Core:</b> ${core_ver} | <b>UI:</b> ${web_ver} | <b>Bot:</b> ${BOT_VERSION}\n${E_GLOB} <b>WAN IP:</b> ${wan_ip}\n${route_icon} <b>Bot Route:</b> ${route_display}"
         [ -n "$ip_str" ] && out="${out}\n${E_NET} ${ip_str}"
         out="${out}${stat_out}"
 
@@ -1028,14 +1055,12 @@ handle_command() {
     "cmd_get_toml") send_document "/var/etc/telemt.toml" "Config" ;;
 
     # ── Runtime Info — adaptive pages ──
-    # Pages: Health → Upstreams → [ME if on] → System
+    # Chain: Health → Upstreams → [ME if on] → Users+IPs → System → [Beobachten if on]
     "cmd_runtime_info"|"cmd_rtinfo_health")
         local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
-        local a_port=$(uci -q get telemt.general.api_port || echo "9091")
-        local me_on=0; is_me_on && me_on=1
-        local total_p=3; [ "$me_on" = "1" ] && total_p=4
+        local tp=$(rtinfo_pages)
 
-        local out="${E_SCAN} <b>Runtime (1/${total_p}) — Health</b>\n"
+        local out="${E_SCAN} <b>Runtime (1/${tp}) — Health</b>\n"
         local prom=$(api_local "$m_port" "metrics")
         if [ -n "$prom" ]; then
             local upt=$(echo "$prom" | awk '/^telemt_uptime_seconds /{print $2}')
@@ -1062,16 +1087,16 @@ handle_command() {
             [ "${up_att:-0}" -gt 0 ] 2>/dev/null && rate=$(awk "BEGIN{printf \"%.0f%%\", ${up_ok:-0}/${up_att}*100}")
 
             out="${out}\nUptime: ${u_d}d ${u_h}h ${u_m}m"
-            out="${out}\nActive now: <b>${c_cur:-0}</b>"
-            [ "$me_on" = "1" ] && out="${out} (direct: ${c_dir:-0}, ME: ${c_me:-0})"
-            out="${out}\nTotal: ${conn:-0} | Rejected: ${rej:-0}"
-            [ "${hs_to:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} HS Timeout: ${hs_to}"
+            out="${out}\nLive connections: <b>${c_cur:-0}</b>"
+            is_me_on && out="${out} (direct: ${c_dir:-0}, ME: ${c_me:-0})"
+            out="${out}\nTotal accepted: ${conn:-0} | Rejected: ${rej:-0}"
+            [ "${hs_to:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Handshake Timeouts: ${hs_to}"
             [ "${dpi:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} DPI Tamper: ${dpi}" || out="${out}\nDPI Tamper: 0"
             [ "${inv_pad:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_ERR} Invalid padding: ${inv_pad}"
             [ "${evict:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Evicted sessions: ${evict}"
             out="${out}\n\n<b>Upstream Connect</b>"
             out="${out}\nAttempts: ${up_att:-0} | OK: ${up_ok:-0} | Fail: ${up_fail:-0}"
-            out="${out}\nRate: ${rate}"
+            out="${out}\nSuccess rate: ${rate}"
         else
             out="${out}\n<i>Prometheus unavailable</i>"
         fi
@@ -1084,12 +1109,11 @@ handle_command() {
     "cmd_rtinfo_ups")
         local a_port=$(uci -q get telemt.general.api_port || echo "9091")
         local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
-        local me_on=0; is_me_on && me_on=1
-        local total_p=3; [ "$me_on" = "1" ] && total_p=4
+        local tp=$(rtinfo_pages)
+        local pn=2
 
-        local out="${E_SCAN} <b>Runtime (2/${total_p}) — Upstreams</b>\n"
+        local out="${E_SCAN} <b>Runtime (${pn}/${tp}) — Upstreams</b>\n"
 
-        # Try new API first (3.3.22+), then old (3.3.15+), then Prometheus
         local api_up=$(api_local "$a_port" "v1/runtime/upstream_quality")
         if [ -n "$api_up" ] && echo "$api_up" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             local cfg=$(echo "$api_up" | jsonfilter -e "@.data.summary.configured_total" 2>/dev/null)
@@ -1101,9 +1125,7 @@ handle_command() {
             local ca=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_attempt_total" 2>/dev/null)
             local cs=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_success_total" 2>/dev/null)
             local cf=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_fail_total" 2>/dev/null)
-            local cff=$(echo "$api_up" | jsonfilter -e "@.data.counters.connect_failfast_hard_error_total" 2>/dev/null)
             out="${out}\nAttempts: ${ca:-0} | OK: ${cs:-0} | Fail: ${cf:-0}"
-            [ "${cff:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Hard failfast: ${cff}"
 
             local i=0
             while true; do
@@ -1118,10 +1140,21 @@ handle_command() {
                 local lat_s="—"; [ -n "$lat" ] && lat_s=$(awk "BEGIN{printf \"%.1f\", $lat}")
                 out="${out}\n\n${ic} <b>${kind}://${addr}</b> w:${w:-1}"
                 out="${out}\n   fails:${f:-0} | lat:${lat_s}ms"
+                # Per-DC latency for this upstream
+                local d=0
+                while true; do
+                    local dc_id=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].dc[$d].dc" 2>/dev/null)
+                    [ -z "$dc_id" ] && break
+                    local dc_lat=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].dc[$d].latency_ema_ms" 2>/dev/null)
+                    local dc_lat_s="—"; [ -n "$dc_lat" ] && dc_lat_s=$(awk "BEGIN{printf \"%.0f\", $dc_lat}")
+                    out="${out}\n   DC${dc_id}: ${dc_lat_s}ms"
+                    d=$((d + 1))
+                    [ "$d" -ge 5 ] && break
+                done
                 i=$((i + 1))
             done
         else
-            # Fallback: old API (3.3.15+)
+            # Fallback: old API
             local api_old=$(api_local "$a_port" "v1/stats/upstreams")
             if [ -n "$api_old" ] && echo "$api_old" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
                 local i=0
@@ -1136,9 +1169,7 @@ handle_command() {
                     out="${out}\n${ic} ${addr} | fails:${f:-0} | ${lat_s}ms"
                     i=$((i + 1))
                 done
-                out="${out}\n\n<i>Detailed view: binary 3.3.22+</i>"
             else
-                # Fallback: Prometheus only
                 local prom=$(api_local "$m_port" "metrics")
                 local ua=$(echo "$prom" | awk '/^telemt_upstream_connect_attempt_total /{print $2}')
                 local us=$(echo "$prom" | awk '/^telemt_upstream_connect_success_total /{print $2}')
@@ -1148,19 +1179,8 @@ handle_command() {
             fi
         fi
 
-        # Retry histogram from Prometheus (bonus)
-        local prom_h=$(api_local "$m_port" "metrics")
-        if [ -n "$prom_h" ]; then
-            local b2=$(echo "$prom_h" | awk '/upstream_connect_attempts_per_request\{bucket="2"\}/{print $2}')
-            local b34=$(echo "$prom_h" | awk '/upstream_connect_attempts_per_request\{bucket="3_4"\}/{print $2}')
-            local bgt=$(echo "$prom_h" | awk '/upstream_connect_attempts_per_request\{bucket="gt_4"\}/{print $2}')
-            if [ "${b2:-0}" -gt 0 ] 2>/dev/null || [ "${b34:-0}" -gt 0 ] 2>/dev/null || [ "${bgt:-0}" -gt 0 ] 2>/dev/null; then
-                out="${out}\n\n<b>Retries:</b> 2nd:${b2:-0} 3-4:${b34:-0} >4:${bgt:-0}"
-            fi
-        fi
-
         local prv="cmd_rtinfo_health"
-        local nxt="cmd_rtinfo_sys"; [ "$me_on" = "1" ] && nxt="cmd_rtinfo_me"
+        local nxt="cmd_rtinfo_users"; is_me_on && nxt="cmd_rtinfo_me"
         local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_ups\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"${nxt}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         rtinfo_send "$out" "$kb"
         ;;
@@ -1168,10 +1188,11 @@ handle_command() {
     "cmd_rtinfo_me")
         local a_port=$(uci -q get telemt.general.api_port || echo "9091")
         local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+        local tp=$(rtinfo_pages)
+        local pn=3
 
-        local out="${E_SCAN} <b>Runtime (3/4) — ME Pool</b>\n"
+        local out="${E_SCAN} <b>Runtime (${pn}/${tp}) — ME Pool</b>\n"
 
-        # Try new API (3.3.22+)
         local api_me=$(api_local "$a_port" "v1/runtime/me_quality")
         if [ -n "$api_me" ] && echo "$api_me" | jsonfilter -e "@.data" 2>/dev/null | grep -q "{"; then
             local idle=$(echo "$api_me" | jsonfilter -e "@.data.counters.idle_close_by_peer_total" 2>/dev/null)
@@ -1195,17 +1216,13 @@ handle_command() {
                 j=$((j + 1))
             done
         else
-            # Fallback: Prometheus ME counters
             local prom=$(api_local "$m_port" "metrics")
             local mw_act=$(echo "$prom" | awk '/^telemt_me_writers_active_current /{print $2}')
             local mw_warm=$(echo "$prom" | awk '/^telemt_me_writers_warm_current /{print $2}')
-            local me_ka_to=$(echo "$prom" | awk '/^telemt_me_keepalive_timeout_total /{print $2}')
             local me_reconn=$(echo "$prom" | awk '/^telemt_me_reconnect_success_total /{print $2}')
             local me_kdf=$(echo "$prom" | awk '/^telemt_me_kdf_drift_total /{print $2}')
             out="${out}\nWriters: active=${mw_act:-0} warm=${mw_warm:-0}"
-            [ "${me_ka_to:-0}" -gt 0 ] 2>/dev/null && out="${out}\n${E_WARN} Keepalive timeouts: ${me_ka_to}"
             out="${out}\nReconnects: ${me_reconn:-0} | KDF drift: ${me_kdf:-0}"
-            out="${out}\n\n<i>Per-DC detail: binary 3.3.22+</i>"
         fi
 
         # NAT/STUN
@@ -1230,19 +1247,72 @@ handle_command() {
         fi
 
         local prv="cmd_rtinfo_ups"
-        local nxt="cmd_rtinfo_sys"
+        local nxt="cmd_rtinfo_users"
         local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_me\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"${nxt}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rtinfo_send "$out" "$kb"
+        ;;
+
+    "cmd_rtinfo_users")
+        local a_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local tp=$(rtinfo_pages)
+        local pn=3; is_me_on && pn=4
+
+        local out="${E_SCAN} <b>Runtime (${pn}/${tp}) — Active Users</b>\n"
+
+        local api_users=$(api_local "$a_port" "v1/users")
+        if [ -n "$api_users" ] && echo "$api_users" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local n_online=0 n_total=0
+            local u_lines=""
+            local i=0
+            while true; do
+                local u=$(echo "$api_users" | jsonfilter -e "@.data[$i].username" 2>/dev/null)
+                [ -z "$u" ] && break
+                n_total=$((n_total + 1))
+                local cc=$(echo "$api_users" | jsonfilter -e "@.data[$i].current_connections" 2>/dev/null)
+                if [ "${cc:-0}" -gt 0 ] 2>/dev/null; then
+                    n_online=$((n_online + 1))
+                    local aips=$(echo "$api_users" | jsonfilter -e "@.data[$i].active_unique_ips" 2>/dev/null)
+                    local oct=$(echo "$api_users" | jsonfilter -e "@.data[$i].total_octets" 2>/dev/null)
+                    local traf=$(fmt_traffic "${oct:-0}")
+                    u_lines="${u_lines}\n${E_ON} <b>${u}</b>: ${cc} conn, ${aips:-0} IPs, ${traf}"
+                    # Show actual IP addresses
+                    local ip_idx=0
+                    local ip_list=""
+                    while true; do
+                        local ip=$(echo "$api_users" | jsonfilter -e "@.data[$i].active_unique_ips_list[$ip_idx]" 2>/dev/null)
+                        [ -z "$ip" ] && break
+                        [ -n "$ip_list" ] && ip_list="${ip_list}, "
+                        ip_list="${ip_list}${ip}"
+                        ip_idx=$((ip_idx + 1))
+                        [ "$ip_idx" -ge 5 ] && { ip_list="${ip_list}..."; break; }
+                    done
+                    [ -n "$ip_list" ] && u_lines="${u_lines}\n   <code>${ip_list}</code>"
+                fi
+                i=$((i + 1))
+            done
+            out="${out}\n<b>${n_online} online / ${n_total} total</b>"
+            if [ "$n_online" -gt 0 ]; then
+                out="${out}${u_lines}"
+            else
+                out="${out}\n<i>No active connections</i>"
+            fi
+        else
+            out="${out}\n<i>User API unavailable</i>"
+        fi
+
+        local prv="cmd_rtinfo_ups"; is_me_on && prv="cmd_rtinfo_me"
+        local nxt="cmd_rtinfo_sys"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_users\"},{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"${nxt}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         rtinfo_send "$out" "$kb"
         ;;
 
     "cmd_rtinfo_sys")
         local a_port=$(uci -q get telemt.general.api_port || echo "9091")
-        local me_on=0; is_me_on && me_on=1
-        local total_p=3; [ "$me_on" = "1" ] && total_p=4
+        local tp=$(rtinfo_pages)
+        local pn=4; is_me_on && pn=5
 
-        local out="${E_SCAN} <b>Runtime (${total_p}/${total_p}) — System</b>\n"
+        local out="${E_SCAN} <b>Runtime (${pn}/${tp}) — System</b>\n"
 
-        # Try /v1/system/info (3.3.19+)
         local api_sys=$(api_local "$a_port" "v1/system/info")
         if [ -n "$api_sys" ] && echo "$api_sys" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             local ver=$(echo "$api_sys" | jsonfilter -e "@.data.version" 2>/dev/null)
@@ -1262,7 +1332,6 @@ handle_command() {
             out="${out}\n<i>System API: binary 3.3.19+</i>"
         fi
 
-        # Gates (3.3.19+)
         local api_g=$(api_local "$a_port" "v1/runtime/gates")
         if [ -n "$api_g" ] && echo "$api_g" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
             local acc=$(echo "$api_g" | jsonfilter -e "@.data.accepting_new_connections" 2>/dev/null)
@@ -1270,14 +1339,13 @@ handle_command() {
             out="${out}\n\n<b>Gates</b>"
             local acc_ic="${E_ON}"; [ "$acc" != "true" ] && acc_ic="${E_ERR}"
             out="${out}\nAccepting: ${acc_ic} | Startup: ${startup:-?}"
-            if [ "$me_on" = "1" ]; then
+            if is_me_on; then
                 local me_rdy=$(echo "$api_g" | jsonfilter -e "@.data.me_runtime_ready" 2>/dev/null)
                 local me_ic="${E_ON}"; [ "$me_rdy" != "true" ] && me_ic="${E_ERR}"
                 out="${out}\nME ready: ${me_ic}"
             fi
         fi
 
-        # Recent events (3.3.22+, optional — single call, no fallback)
         local api_ev=$(api_local "$a_port" "v1/runtime/events/recent?limit=5")
         if [ -n "$api_ev" ] && echo "$api_ev" | jsonfilter -e "@.data.events[0].event_type" 2>/dev/null | grep -q "."; then
             out="${out}\n\n<b>Recent Events</b>"
@@ -1292,22 +1360,61 @@ handle_command() {
             done
         fi
 
-        local prv="cmd_rtinfo_ups"; [ "$me_on" = "1" ] && prv="cmd_rtinfo_me"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_sys\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        local prv="cmd_rtinfo_users"
+        local nxt_kb=""
+        if is_beob_on; then
+            nxt_kb=",{\"text\":\"Next \\u27a1\\ufe0f\",\"callback_data\":\"cmd_rtinfo_beob\"}"
+        fi
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_sys\"}${nxt_kb}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         rtinfo_send "$out" "$kb"
         ;;
+
+    "cmd_rtinfo_beob")
+        local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+        local tp=$(rtinfo_pages)
+
+        local out="${E_SCAN} <b>Runtime (${tp}/${tp}) — Beobachten</b>\n"
+        out="${out}\n<i>Forensic observation / scanner tracking</i>\n"
+
+        local beob_data=$(api_local "$m_port" "beobachten")
+        if [ -n "$beob_data" ] && [ "$(echo "$beob_data" | wc -c)" -gt 10 ]; then
+            # Beobachten returns plain text with IP forensic data
+            local line_count=$(echo "$beob_data" | wc -l)
+            out="${out}\n<b>Active entries:</b> ${line_count}"
+            # Show first 15 lines (avoid Telegram message limit)
+            local preview=$(echo "$beob_data" | head -15 | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
+            out="${out}\n<pre>${preview}</pre>"
+            [ "$line_count" -gt 15 ] && out="${out}\n<i>... and $((line_count - 15)) more entries</i>"
+        else
+            out="${out}\n<i>No scanner activity detected or beobachten endpoint unavailable.</i>"
+        fi
+
+        local prv="cmd_rtinfo_sys"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"\\u2b05\\ufe0f Prev\",\"callback_data\":\"${prv}\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_rtinfo_beob\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        rtinfo_send "$out" "$kb"
+        ;;
+
     # ── Stop / Restart ──
     "cmd_stop")
         uci_safe set telemt.general.enabled='0'; uci_safe_commit
         /etc/init.d/telemt stop; sleep 1
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        send_message "<b>${E_STP} STOPPED</b>" "$kb"
+        logger -t telemt-bot "Proxy stopped by admin"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_ON} Start Proxy\",\"callback_data\":\"cmd_start\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "${E_STP} <b>Proxy stopped</b>" "$kb"
+        ;;
+    "cmd_start")
+        uci_safe set telemt.general.enabled='1'; uci_safe_commit
+        /etc/init.d/telemt start; sleep 2
+        logger -t telemt-bot "Proxy started by admin"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "${E_ON} <b>Proxy started</b>" "$kb"
         ;;
     "cmd_restart")
         uci_safe set telemt.general.enabled='1'; uci_safe_commit
         /etc/init.d/telemt restart; sleep 2
+        logger -t telemt-bot "Proxy restarted by admin"
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        send_message "<b>${E_OK} RESTARTED</b>" "$kb"
+        send_message "${E_OK} <b>Proxy restarted</b>" "$kb"
         ;;
 
     cmd_restart_stay_mp)
@@ -1545,11 +1652,19 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-logger -t telemt-bot "Starting v${BOT_VERSION} Long Polling loop..."
+logger -t telemt-bot "=== Bot v${BOT_VERSION} starting ==="
+BOT_START_EPOCH=$(date +%s)
 update_proxy_cache
 cache_versions
 refresh_wan_ip
 start_health_daemon
+logger -t telemt-bot "Polling: ${LAST_ROUTE} | Health PID: ${HEALTH_PID:-?}"
+
+# Announce startup in chat
+_ts=$(date '+%H:%M')
+_proxy_st="STOPPED"; pidof telemt >/dev/null 2>&1 && _proxy_st="RUNNING"
+_ucnt=$(uci show telemt 2>/dev/null | grep -c '=user')
+send_message "${E_PRF} <b>telemt-bot v${BOT_VERSION}</b> started\n${E_SET} ${_ts} | Route: <b>${LAST_ROUTE}</b>\n${E_STAT} Proxy: ${_proxy_st} | Users: ${_ucnt}"
 
 while true; do
     response=$(api_poll)
