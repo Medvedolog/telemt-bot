@@ -514,35 +514,64 @@ handle_command() {
                     send_message "${E_OK} User renamed! (Press Apply)"
                     handle_command "user_manage_${new_name}"; return ;;
                 quota)
-                    [ "$cmd" = "0" ] && uci_safe delete "telemt.${tgt}.data_quota" || uci_safe set "telemt.${tgt}.data_quota=${cmd}"
+                    local qv=$(echo "$cmd" | tr -d ' \r\n\t' | tr ',' '.')
+                    if [ "$qv" = "0" ]; then
+                        uci_safe delete "telemt.${tgt}.data_quota" 2>/dev/null
+                    elif echo "$qv" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+                        uci_safe set "telemt.${tgt}.data_quota=${qv}"
+                    else
+                        send_message "${E_ERR} Invalid quota! Enter a number in GB (e.g. 5 or 1.5), or 0 for unlimited."
+                        handle_command "user_manage_${tgt}"; return
+                    fi
                     uci_safe_commit; send_message "${E_OK} Quota updated! (Press Apply)"; handle_command "user_manage_${tgt}"; return ;;
                 ips)
-                    [ "$cmd" = "0" ] && uci_safe delete "telemt.${tgt}.max_unique_ips" || uci_safe set "telemt.${tgt}.max_unique_ips=${cmd}"
+                    local iv=$(echo "$cmd" | tr -d ' \r\n\t')
+                    if [ "$iv" = "0" ]; then
+                        uci_safe delete "telemt.${tgt}.max_unique_ips" 2>/dev/null
+                    elif echo "$iv" | grep -qE '^[0-9]+$' && [ "$iv" -gt 0 ] 2>/dev/null && [ "$iv" -le 1000 ] 2>/dev/null; then
+                        uci_safe set "telemt.${tgt}.max_unique_ips=${iv}"
+                    else
+                        send_message "${E_ERR} Invalid! Enter a number 1-1000, or 0 for unlimited."
+                        handle_command "user_manage_${tgt}"; return
+                    fi
                     uci_safe_commit; send_message "${E_OK} Max IPs updated! (Press Apply)"; handle_command "user_manage_${tgt}"; return ;;
                 expiry)
-                    [ "$cmd" = "0" ] && uci_safe delete "telemt.${tgt}.expire_date" || uci_safe set "telemt.${tgt}.expire_date=${cmd}"
+                    local ev=$(echo "$cmd" | tr -d '\r\t')
+                    if [ "$ev" = "0" ]; then
+                        uci_safe delete "telemt.${tgt}.expire_date" 2>/dev/null
+                    elif echo "$ev" | grep -qE '^[0-9]{2}\.[0-9]{2}\.[0-9]{4} [0-9]{2}:[0-9]{2}$'; then
+                        uci_safe set "telemt.${tgt}.expire_date=${ev}"
+                    else
+                        send_message "${E_ERR} Invalid format! Use: DD.MM.YYYY HH:MM (e.g. 31.12.2026 23:59), or 0 to clear."
+                        handle_command "user_manage_${tgt}"; return
+                    fi
                     uci_safe_commit; send_message "${E_OK} Expiry updated! (Press Apply)"; handle_command "user_manage_${tgt}"; return ;;
                 upedit)
                     local new_addr=$(echo "$cmd" | tr -d ' \r\n\t')
-                    if echo "$new_addr" | grep -qE '^.+:[0-9]+$'; then
+                    # Sanitize: strip quotes, backslashes, semicolons
+                    new_addr=$(echo "$new_addr" | tr -d ';"'"'"'\\')
+                    if echo "$new_addr" | grep -qE '^[a-zA-Z0-9._-]+:[0-9]+$'; then
                         uci_safe set "telemt.${tgt}.address=${new_addr}"; uci_safe_commit
                         send_message "${E_OK} Upstream address updated! (Press Apply)"
-                    else send_message "${E_ERR} Invalid format! Must be IP:PORT."; fi
+                    else send_message "${E_ERR} Invalid! Use: IP:PORT or hostname:PORT (e.g. 192.168.1.1:1080)."; fi
                     handle_command "up_manage_${tgt}"; return ;;
                 upweight)
                     local w=$(echo "$cmd" | tr -d ' \r\n\t')
-                    if echo "$w" | grep -qE '^[0-9]+$' && [ "$w" -gt 0 ] 2>/dev/null; then
+                    if echo "$w" | grep -qE '^[0-9]+$' && [ "$w" -gt 0 ] 2>/dev/null && [ "$w" -le 10000 ] 2>/dev/null; then
                         uci_safe set "telemt.${tgt}.weight=${w}"; uci_safe_commit
                         send_message "${E_OK} Weight set to ${w}!"
-                    else send_message "${E_ERR} Invalid weight! Enter a positive number."; fi
+                    else send_message "${E_ERR} Invalid weight! Enter 1-10000."; fi
                     handle_command "up_manage_${tgt}"; return ;;
                 upalias)
-                    local al=$(echo "$cmd" | tr -d '\r\n\t' | cut -c1-30)
+                    # Strip HTML tags, quotes, control chars; max 20 chars
+                    local al=$(echo "$cmd" | tr -d '\r\n\t' | sed 's/<[^>]*>//g' | tr -d ';"'"'"'\\<>' | cut -c1-20)
                     if [ "$al" = "." ] || [ -z "$al" ]; then
                         uci_safe delete "telemt.${tgt}.alias" 2>/dev/null
                         send_message "${E_OK} Name cleared."
+                    elif echo "$al" | grep -qE '^[a-zA-Z0-9 _.:-]+$'; then
+                        uci_safe set "telemt.${tgt}.alias=${al}"; send_message "${E_OK} Name: ${al}"
                     else
-                        uci_safe set "telemt.${tgt}.alias=${al}"; send_message "${E_OK} Name set: ${al}"
+                        send_message "${E_ERR} Invalid name! Use letters, numbers, spaces, dots, dashes."
                     fi
                     uci_safe_commit; handle_command "up_manage_${tgt}"; return ;;
             esac
