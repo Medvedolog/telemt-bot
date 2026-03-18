@@ -169,6 +169,32 @@ The UCI config file `/etc/config/telemt` is **shared** between `luci-app-telemt`
 - **Local API access:** The bot queries telemt via `127.0.0.1` only.
 - **UCI locking:** All UCI writes use `flock` to prevent race conditions with LuCI.
 
-## License
+<h2>Architecture</h2>
 
-MIT
+<p>A single-file POSIX shell bot — 1600 lines of pure <code>/bin/sh</code> running natively on OpenWrt's BusyBox ash. Full-featured Telegram bot with inline keyboards, edit-in-place message updates, multi-page navigation, 3-tier network failover, background health daemon, input validation, and native UCI config integration. Zero external dependencies beyond what ships with every OpenWrt install.</p>
+
+<h3>Why not Python?</h3>
+
+<table>
+  <tr><th></th><th>Python bot</th><th>telemt-bot (sh)</th></tr>
+  <tr><td><b>RAM usage</b></td><td>40–80 MB</td><td>3–5 MB</td></tr>
+  <tr><td><b>Dependencies</b></td><td>python3, pip, venv, requests, telegram lib</td><td>None (BusyBox built-in)</td></tr>
+  <tr><td><b>Install</b></td><td>pip install + venv + requirements.txt</td><td>Copy 1 file</td></tr>
+  <tr><td><b>Startup time</b></td><td>2–3 seconds (imports)</td><td>Instant</td></tr>
+  <tr><td><b>Crash recovery</b></td><td>systemd / supervisor</td><td>procd native</td></tr>
+  <tr><td><b>Config integration</b></td><td>Custom parser</td><td>UCI native</td></tr>
+  <tr><td><b>SOCKS failover</b></td><td>Extra library</td><td>curl flag</td></tr>
+  <tr><td><b>Runs on 64 MB RAM router</b></td><td>No</td><td>Yes</td></tr>
+  <tr><td><b>Cross-arch</b></td><td>Needs python3 for target arch</td><td>Any arch — it's a shell script</td></tr>
+</table>
+
+<h3>Design Principles</h3>
+<ul>
+  <li><b>Single file, zero dependencies.</b> No virtualenv, no <code>__pycache__</code>, no pip, no version conflicts. <code>scp telemt-bot root@router:/usr/bin/</code> — done.</li>
+  <li><b>BusyBox-native.</b> Uses only tools already present in every OpenWrt image: awk, sed, grep, jsonfilter, uclient-fetch, logger.</li>
+  <li><b>curl is optional.</b> Enables SOCKS5 proxy for Telegram API polling and emergency IP resolution. Without it, the bot falls back to direct <code>uclient-fetch</code> — still fully functional.</li>
+  <li><b>POSIX strict.</b> No bashisms — no <code>[[ ]]</code>, no <code>(( ))</code>, no arrays, no here-strings, no process substitution. Runs on ash, dash, and any POSIX sh.</li>
+  <li><b>UCI is the single source of truth.</b> Bot reads and writes <code>/etc/config/telemt</code> — the same config that LuCI web UI and init.d use. No separate config files, no sync issues.</li>
+  <li><b>Graceful degradation.</b> Every API call has a fallback path. New binary endpoints → old endpoints → Prometheus metrics → cached values. Works with telemt v3.2.x through v3.3.22+.</li>
+  <li><b>Runs anywhere OpenWrt runs.</b> From 64 MB MIPS routers to aarch64 boards to x86 VMs. Same script, no recompilation, no per-arch packages.</li>
+</ul>
