@@ -111,6 +111,34 @@ get_tg_path() {
     [ "$mp" = "1" ] && echo "ME" || echo "Direct-DC"
 }
 
+# Fetch all users live stats from API into temp file (graceful: empty file if API off)
+# Format per line: username|conns|active_ips|max_ips|total_octets
+fetch_users_live() {
+    local outfile="$1"
+    local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+    local raw=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/users" 2>/dev/null)
+    : > "$outfile"
+    [ -z "$raw" ] && return 1
+    echo "$raw" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true" || return 1
+    local i=0
+    while true; do
+        local u=$(echo "$raw" | jsonfilter -e "@.data[$i].username" 2>/dev/null)
+        [ -z "$u" ] && break
+        local c=$(echo "$raw" | jsonfilter -e "@.data[$i].current_connections" 2>/dev/null)
+        local aips=$(echo "$raw" | jsonfilter -e "@.data[$i].active_unique_ips" 2>/dev/null)
+        local mips=$(echo "$raw" | jsonfilter -e "@.data[$i].max_unique_ips" 2>/dev/null)
+        local oct=$(echo "$raw" | jsonfilter -e "@.data[$i].total_octets" 2>/dev/null)
+        echo "${u}|${c:-0}|${aips:-0}|${mips:-}|${oct:-0}" >> "$outfile"
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# Format traffic bytes to human-readable
+fmt_traffic() {
+    awk "BEGIN { m=$1/1048576; if(m>1024) printf \"%.1f GB\",m/1024; else printf \"%.0f MB\",m }"
+}
+
 # ─── 0e. Version cache (read from init.d cache files — never exec telemt binary) ───
 CACHED_CORE_VER=""
 CACHED_WEB_VER=""
@@ -301,6 +329,28 @@ send_message() {
     [ -n "$keyboard" ] && json="${json},\"reply_markup\":${keyboard}"
     json="${json}}"
     api_request "sendMessage" "$json" >/dev/null
+}
+
+# Send message and return message_id for later edit-in-place
+send_message_get_id() {
+    local text="$1" keyboard="$2"
+    text=$(printf "%s" "$text" | tr -d '\r\t' | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+    local json="{\"chat_id\":\"${ADMIN_ID}\",\"text\":\"${text}\",\"parse_mode\":\"HTML\""
+    [ -n "$keyboard" ] && json="${json},\"reply_markup\":${keyboard}"
+    json="${json}}"
+    local resp=$(api_request "sendMessage" "$json")
+    echo "$resp" | jsonfilter -e "@.result.message_id" 2>/dev/null
+}
+
+# Edit existing message in place (no new message in chat)
+edit_message() {
+    local msg_id="$1" text="$2" keyboard="$3"
+    [ -z "$msg_id" ] && { send_message "$text" "$keyboard"; return; }
+    text=$(printf "%s" "$text" | tr -d '\r\t' | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+    local json="{\"chat_id\":\"${ADMIN_ID}\",\"message_id\":${msg_id},\"text\":\"${text}\",\"parse_mode\":\"HTML\""
+    [ -n "$keyboard" ] && json="${json},\"reply_markup\":${keyboard}"
+    json="${json}}"
+    api_request "editMessageText" "$json" >/dev/null
 }
 
 send_document() {
@@ -582,7 +632,7 @@ handle_command() {
 
     # ── Main menu ──
     "/start"|"/menu")
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"}]]}"
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Egress: <b>$(get_egress_type)</b> | TG: <b>$(get_tg_path)</b>\nSelect an action:" "$kb"
         ;;
@@ -715,7 +765,11 @@ handle_command() {
         out="${out}${stat_out}"
 
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_FILE} Get TOML\",\"callback_data\":\"cmd_get_toml\"},{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_log\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        send_message "$out" "$kb"
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
+        fi
         ;;
 
     # ── Middle Proxy ──
@@ -724,7 +778,7 @@ handle_command() {
         local st="${E_ERR} DISABLED"; local t_btn="${E_OK} Enable"
         if [ "$mp" = "1" ] || [ "$mp" = "true" ] || [ "$mp" = "on" ]; then st="${E_OK} ENABLED"; t_btn="${E_ERR} Disable"; fi
         local out="${E_SHLD} <b>Telegram Middle Proxy</b>\n\n<b>Status:</b> ${st}\n\n<i>Note: Toggling this enables/disables Middle Proxy routing AND STUN probing simultaneously. Press Apply to restart proxy.</i>"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"mp_toggle\"}],[{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_mp\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"mp_toggle\"}],[{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_restart_stay_mp\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
         send_message "$out" "$kb"
         ;;
 
@@ -740,27 +794,16 @@ handle_command() {
 
     # ── Users list ──
     "cmd_users"|"/users")
-        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
-        # Fetch live per-user stats from API (zero-cost, localhost)
-        local api_raw=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/users" 2>/dev/null)
-        # Build lookup: username -> conns|ips|octets
         local user_live_file=$(mktemp /tmp/tbot_users.XXXXXX)
-        if [ -n "$api_raw" ]; then
-            echo "$api_raw" | awk -F'"' '
-            /"username":/ { u=$4 }
-            /"current_connections":/ { match($0, /[0-9]+/); c=substr($0, RSTART, RLENGTH) }
-            /"active_unique_ips":/ { match($0, /[0-9]+/); ip=substr($0, RSTART, RLENGTH) }
-            /"total_octets":/ { match($0, /[0-9]+/); o=substr($0, RSTART, RLENGTH); if(u) print u"|"c"|"ip"|"o; u="" }
-            ' > "$user_live_file"
-        fi
+        fetch_users_live "$user_live_file"
 
         local u_online="" u_offline="" u_frozen=""
         local kb_on="" kb_off="" kb_frz=""
         local n_on=0 n_off=0 n_frz=0
 
         for user in $(uci show telemt | grep '=user' | cut -d. -f2 | cut -d= -f1); do
-            local disabled=$(uci -q get "telemt.${user}.enabled")
-            [ "$disabled" = "0" ] && {
+            local en=$(uci -q get "telemt.${user}.enabled")
+            [ "$en" = "0" ] && {
                 n_frz=$((n_frz + 1))
                 u_frozen="${u_frozen}${E_FRZ} <b>${user}</b> [paused]\n"
                 kb_frz="${kb_frz}{\"text\":\"${E_FRZ} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
@@ -768,24 +811,22 @@ handle_command() {
             }
 
             local conns=0 ips=0 octets=0
-            if [ -f "$user_live_file" ]; then
-                local line=$(grep "^${user}|" "$user_live_file")
-                if [ -n "$line" ]; then
-                    conns=$(echo "$line" | cut -d'|' -f2)
-                    ips=$(echo "$line" | cut -d'|' -f3)
-                    octets=$(echo "$line" | cut -d'|' -f4)
-                fi
+            local line=$(grep "^${user}|" "$user_live_file" 2>/dev/null)
+            if [ -n "$line" ]; then
+                conns=$(echo "$line" | cut -d'|' -f2)
+                ips=$(echo "$line" | cut -d'|' -f3)
+                octets=$(echo "$line" | cut -d'|' -f5)
             fi
-            local traf_mb=$(awk "BEGIN { m=$octets/1048576; if(m>1024) printf \"%.1f GB\",m/1024; else printf \"%.0f MB\",m }")
-            local ip_str=""; [ "$ips" -gt 0 ] 2>/dev/null && ip_str=", ${ips} IP"
+            local traf=$(fmt_traffic "${octets:-0}")
+            local ip_str=""; [ "${ips:-0}" -gt 0 ] 2>/dev/null && ip_str=", ${ips} IP"
 
-            if [ "$conns" -gt 0 ] 2>/dev/null; then
+            if [ "${conns:-0}" -gt 0 ] 2>/dev/null; then
                 n_on=$((n_on + 1))
-                u_online="${u_online}${E_OK} <b>${user}</b> (${conns} conn${ip_str}) | ${traf_mb}\n"
+                u_online="${u_online}${E_OK} <b>${user}</b> (${conns} conn${ip_str}) | ${traf}\n"
                 kb_on="${kb_on}{\"text\":\"${E_OK} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
             else
                 n_off=$((n_off + 1))
-                u_offline="${u_offline}${E_OFF} ${user} | ${traf_mb}\n"
+                u_offline="${u_offline}${E_OFF} ${user} | ${traf}\n"
                 kb_off="${kb_off}{\"text\":\"${E_OFF} ${user}\",\"callback_data\":\"user_manage_${user}\"},"
             fi
         done
@@ -798,7 +839,7 @@ handle_command() {
         [ -n "$u_frozen" ] && u_list="${u_list}${u_frozen}"
         [ "$total" -eq 0 ] && u_list="${E_USR} No users configured."
 
-        # Build keyboard: 2 buttons per row (online first, then offline, then frozen)
+        # Build keyboard: 2 buttons per row
         local all_btns="${kb_on}${kb_off}${kb_frz}"
         all_btns=$(echo "$all_btns" | sed 's/,$//')
         local kb_rows="" btn_buf="" btn_count=0
@@ -919,7 +960,7 @@ handle_command() {
             st="${E_FRZ} FROZEN"; t_btn="${E_OK} Enable"; fi
         local name_str=""; [ -n "$al" ] && name_str="\n<b>Name:</b> ${al}"
         local out="${E_GLOB} <b>Upstream Proxy Settings</b>\n\n<b>Type:</b> ${t}${name_str}\n<b>Address:</b> <code>${a}</code>\n<b>Weight:</b> ${w}\n<b>Status:</b> ${st}\n\n<i>Use Apply to activate changes.</i>"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${E_EDIT} Edit Addr\",\"callback_data\":\"up_edit_${u}\"}],[{\"text\":\"${E_EDIT} Type\",\"callback_data\":\"up_chtype_${u}\"},{\"text\":\"${E_WGT} Weight\",\"callback_data\":\"up_chweight_${u}\"},{\"text\":\"${E_EDIT} Name\",\"callback_data\":\"up_chalias_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_upstreams\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${E_EDIT} Edit Addr\",\"callback_data\":\"up_edit_${u}\"}],[{\"text\":\"${E_EDIT} Type\",\"callback_data\":\"up_chtype_${u}\"},{\"text\":\"${E_WGT} Weight\",\"callback_data\":\"up_chweight_${u}\"},{\"text\":\"${E_EDIT} Name\",\"callback_data\":\"up_chalias_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_upstreams\"}]]}"
         send_message "$out" "$kb"
         ;;
 
@@ -980,6 +1021,96 @@ handle_command() {
         ;;
     "cmd_get_toml") send_document "/var/etc/telemt.toml" "Config" ;;
 
+    # ── Runtime Info (human-readable diagnostics) ──
+    "cmd_runtime_info")
+        local api_port=$(uci -q get telemt.general.api_port || echo "9091")
+        local m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+        local out="${E_SCAN} <b>Runtime Info</b>\n"
+
+        # Proxy health from Prometheus
+        local prom=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
+        if [ -n "$prom" ]; then
+            local upt=$(echo "$prom" | awk '/^telemt_uptime_seconds /{print $2}')
+            local conn=$(echo "$prom" | awk '/^telemt_connections_total /{print $2}')
+            local rej=$(echo "$prom" | awk '/^telemt_connections_bad_total /{print $2}')
+            local dpi=$(echo "$prom" | awk '/^telemt_desync_total /{print $2}')
+            local up_ok=$(echo "$prom" | awk '/^telemt_upstream_connect_success_total /{print $2}')
+            local up_fail=$(echo "$prom" | awk '/^telemt_upstream_connect_fail_total /{print $2}')
+            local up_att=$(echo "$prom" | awk '/^telemt_upstream_connect_attempt_total /{print $2}')
+            local hs_to=$(echo "$prom" | awk '/^telemt_handshake_timeouts_total /{print $2}')
+
+            local u_d=0 u_h=0 u_m=0
+            if [ -n "$upt" ]; then
+                u_d=$(awk "BEGIN{print int($upt/86400)}")
+                u_h=$(awk "BEGIN{print int(($upt%86400)/3600)}")
+                u_m=$(awk "BEGIN{print int(($upt%3600)/60)}")
+            fi
+            local rate="100%"
+            [ "${up_att:-0}" -gt 0 ] 2>/dev/null && rate=$(awk "BEGIN{printf \"%.0f%%\", ${up_ok:-0}/${up_att}*100}")
+
+            out="${out}\n<b>--- Proxy Health ---</b>"
+            out="${out}\nUptime: ${u_d}d ${u_h}h ${u_m}m"
+            out="${out}\nConnections: ${conn:-0}"
+            out="${out}\nRejected: ${rej:-0}"
+            out="${out}\nHandshake TO: ${hs_to:-0}"
+            out="${out}\nDPI Tamper: ${dpi:-0}"
+            out="${out}\n\n<b>--- Upstream ---</b>"
+            out="${out}\nAttempts: ${up_att:-0}"
+            out="${out}\nSuccess: ${up_ok:-0} | Fails: ${up_fail:-0}"
+            out="${out}\nRate: ${rate}"
+        else
+            out="${out}\n<i>Prometheus unavailable</i>"
+        fi
+
+        # Config summary
+        out="${out}\n\n<b>--- Config ---</b>"
+        out="${out}\nME: $(get_tg_path) | Egress: $(get_egress_type)"
+        local proxy_port=$(uci -q get telemt.general.port || echo "8443")
+        out="${out}\nPort: ${proxy_port}"
+
+        # ME quality from API (graceful)
+        local api_me=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/stats/minimal/all" 2>/dev/null)
+        if [ -n "$api_me" ] && echo "$api_me" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local me_en=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.middle_proxy_enabled" 2>/dev/null)
+            if [ "$me_en" = "true" ]; then
+                local alive=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.summary.alive_writers" 2>/dev/null)
+                local req=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.summary.required_writers" 2>/dev/null)
+                local cov=$(echo "$api_me" | jsonfilter -e "@.data.data.me_writers.summary.coverage_pct" 2>/dev/null)
+                out="${out}\n\n<b>--- ME Pool ---</b>"
+                out="${out}\nWriters: ${alive:-0}/${req:-0}"
+                out="${out}\nCoverage: ${cov:-0}%"
+            fi
+        fi
+
+        # Upstream quality from API
+        local api_up=$(uclient-fetch -q -O - --timeout=2 "http://127.0.0.1:${api_port}/v1/stats/upstreams" 2>/dev/null)
+        if [ -n "$api_up" ] && echo "$api_up" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local i=0
+            local has_ups=0
+            while true; do
+                local addr=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].address" 2>/dev/null)
+                [ -z "$addr" ] && break
+                if [ "$has_ups" = "0" ]; then
+                    out="${out}\n\n<b>--- Upstreams (API) ---</b>"
+                    has_ups=1
+                fi
+                local hlthy=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].healthy" 2>/dev/null)
+                local fails=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].fails" 2>/dev/null)
+                local lat=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].effective_latency_ms" 2>/dev/null)
+                local st_icon="${E_OK}"; [ "$hlthy" != "true" ] && st_icon="${E_ERR}"
+                out="${out}\n${st_icon} ${addr} | fails:${fails:-0} | ${lat:-?}ms"
+                i=$((i + 1))
+            done
+        fi
+
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
+        fi
+        ;;
+
     # ── Stop / Restart ──
     "cmd_stop")
         uci_safe set telemt.general.enabled='0'; uci_safe_commit
@@ -996,17 +1127,17 @@ handle_command() {
 
     cmd_restart_stay_mp)
         uci_safe_commit; /etc/init.d/telemt restart; sleep 1
-        send_message "${E_OK} Applied!"; handle_command "cmd_middle_proxy"
+        send_message "${E_OK} Applied (restart)!"; handle_command "cmd_middle_proxy"
         ;;
-    cmd_restart_stay_user_*)
-        local u="${cmd#cmd_restart_stay_user_}"
-        uci_safe_commit; /etc/init.d/telemt restart; sleep 1
-        send_message "${E_OK} Applied!"; handle_command "user_manage_${u}"
+    cmd_restart_stay_user_*|cmd_apply_stay_user_*)
+        local u="${cmd#cmd_restart_stay_user_}"; u="${u#cmd_apply_stay_user_}"
+        uci_safe_commit; /etc/init.d/telemt reload 2>/dev/null; sleep 1
+        send_message "${E_OK} Applied (hot-reload)!"; handle_command "user_manage_${u}"
         ;;
     cmd_restart_stay_up_*)
         local u="${cmd#cmd_restart_stay_up_}"
         uci_safe_commit; /etc/init.d/telemt restart; sleep 1
-        send_message "${E_OK} Applied!"; handle_command "up_manage_${u}"
+        send_message "${E_OK} Applied (restart)!"; handle_command "up_manage_${u}"
         ;;
 
     # ── User management ──
@@ -1015,50 +1146,68 @@ handle_command() {
         [ "$(uci -q get "telemt.${tgt}")" != "user" ] && return
         local sec=$(uci -q get "telemt.${tgt}.secret" | tr -d '"')
         local q=$(uci -q get "telemt.${tgt}.data_quota" | tr -d '"')
-        [ "$q" != "${E_INF}" ] && [ -n "$q" ] && q="${q} GB" || q="${E_INF}"
-        local i=$(uci -q get "telemt.${tgt}.max_unique_ips" | tr -d '"'); [ -z "$i" ] && i="${E_INF}"
+        [ -n "$q" ] && [ "$q" != "unlimited" ] && q="${q} GB" || q="${E_INF}"
+        local max_ips=$(uci -q get "telemt.${tgt}.max_unique_ips" | tr -d '"'); [ -z "$max_ips" ] && max_ips="${E_INF}"
         local e=$(uci -q get "telemt.${tgt}.expire_date" | tr -d '"'); [ -z "$e" ] && e="${E_INF}"
 
-        local d=$(uci -q get "telemt.${tgt}.disabled" | awk '{print tolower($1)}')
-        local stat_text="${E_OK} [ACTIVE]"; local fr_t="${E_FRZ} Freeze"
-        if [ "$d" = "1" ] || [ "$d" = "true" ] || [ "$d" = "on" ]; then
-            stat_text="${E_FRZ} [FROZEN]"; fr_t="${E_OK} Unfreeze"; fi
+        local en=$(uci -q get "telemt.${tgt}.enabled")
+        local fr_t="${E_FRZ} Freeze"
+        local is_frozen=0
+        if [ "$en" = "0" ]; then is_frozen=1; fr_t="${E_OK} Unfreeze"; fi
 
+        # Fetch live stats from API (graceful: works without API too)
+        local conns=0 active_ips=0 octets=0 link=""
+        local r_usr=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_API_PORT}/v1/users/${tgt}" 2>/dev/null)
+        if [ -n "$r_usr" ] && echo "$r_usr" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            conns=$(echo "$r_usr" | jsonfilter -e "@.data.current_connections" 2>/dev/null)
+            active_ips=$(echo "$r_usr" | jsonfilter -e "@.data.active_unique_ips" 2>/dev/null)
+            octets=$(echo "$r_usr" | jsonfilter -e "@.data.total_octets" 2>/dev/null)
+            link=$(echo "$r_usr" | jsonfilter -e "@.data.links.tls[0]" 2>/dev/null)
+            [ -z "$conns" ] && conns=0
+            [ -z "$active_ips" ] && active_ips=0
+            [ -z "$octets" ] && octets=0
+        else
+            # Fallback: Prometheus metrics
+            local r_live=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_METRICS_PORT}/metrics" 2>/dev/null | grep "user=\"${tgt}\"")
+            conns=$(echo "$r_live" | awk '/connections_current/{print int($2)}')
+            octets=$(echo "$r_live" | awk '/octets_to_client/{s+=$2}/octets_from_client/{s+=$2}END{print int(s)}')
+            active_ips=$(echo "$r_live" | awk '/unique_ips_current/{print int($2)}')
+            [ -z "$conns" ] && conns=0
+            [ -z "$octets" ] && octets=0
+            [ -z "$active_ips" ] && active_ips=0
+        fi
+
+        # Status line: online/offline/frozen/expired
+        local stat_text=""
+        if [ "$is_frozen" = "1" ]; then
+            stat_text="${E_FRZ} [PAUSED]"
+        elif [ "$conns" -gt 0 ] 2>/dev/null; then
+            stat_text="${E_OK} ONLINE (${conns} conn)"
+        else
+            stat_text="${E_OFF} offline"
+        fi
+
+        # Expiry check
         local warn_txt=""
         if [ "$e" != "${E_INF}" ]; then
             local exp_epoch=$(date -d "$(echo "$e" | awk -F'[. :]' 'NF==5 {printf "%04d-%02d-%02d %02d:%02d:00", $3,$2,$1,$4,$5}')" +%s 2>/dev/null)
             local now_epoch=$(date +%s)
-            if [ -n "$exp_epoch" ]; then
-                if [ "$now_epoch" -ge "$exp_epoch" ]; then stat_text="${E_ERR} [EXPIRED]"
-                else
-                    local diff=$((exp_epoch - now_epoch))
-                    [ "$diff" -le 259200 ] && warn_txt="\n${E_WARN} <b>Warning:</b> Expires in $((diff / 86400)) days!"
-                fi
+            if [ -n "$exp_epoch" ] && [ "$now_epoch" -ge "$exp_epoch" ]; then
+                stat_text="${E_ERR} [EXPIRED]"
+            elif [ -n "$exp_epoch" ]; then
+                local diff=$((exp_epoch - now_epoch))
+                [ "$diff" -le 259200 ] && warn_txt="\n${E_WARN} Expires in $((diff / 86400))d!"
             fi
         fi
 
-        local r_usr=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_API_PORT}/v1/users/${tgt}" 2>/dev/null)
-        local usr_conn=$(echo "$r_usr" | jsonfilter -e '@.data.current_connections' 2>/dev/null)
-
-        local out_txrx="" out_conn="0" link=""
-
-        if [ -n "$usr_conn" ]; then
-            local usr_bytes=$(echo "$r_usr" | jsonfilter -e '@.data.total_octets' 2>/dev/null)
-            [ -z "$usr_bytes" ] && usr_bytes="0"
-            out_txrx=$(awk -v b="$usr_bytes" 'BEGIN{if(b>1048576){printf "%.2f MB",b/1048576}else{printf "0 MB"}}')
-            out_conn="$usr_conn"
-            link=$(echo "$r_usr" | jsonfilter -e '@.data.links.tls[0]' 2>/dev/null)
-        else
-            local r_live=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${CACHED_METRICS_PORT}/metrics" 2>/dev/null | grep "user=\"${tgt}\"")
-            local acc_tx=$(grep "^${tgt} " /tmp/telemt_stats.txt 2>/dev/null | awk '{print $2}'); [ -z "$acc_tx" ] && acc_tx=0
-            local acc_rx=$(grep "^${tgt} " /tmp/telemt_stats.txt 2>/dev/null | awk '{print $3}'); [ -z "$acc_rx" ] && acc_rx=0
-
-            local awk_user='BEGIN{tx=0;rx=0;c=0} /octets_to_client/{tx+=$2} /octets_from_client/{rx+=$2} /connections_current/{c=$2} /^ACC_MARKER/{tx+=$2;rx+=$3} END{if(tx>1073741824){ts=sprintf("%.2f GB",tx/1073741824)}else{ts=sprintf("%.2f MB",tx/1048576)};if(rx>1073741824){rs=sprintf("%.2f GB",rx/1073741824)}else{rs=sprintf("%.2f MB",rx/1048576)};printf "DL: %s | UL: %s|%d",ts,rs,c}'
-            local parsed_usr=$(printf "%s\nACC_MARKER %s %s" "${r_live}" "${acc_tx}" "${acc_rx}" | awk "$awk_user")
-
-            out_txrx=$(echo "$parsed_usr" | cut -d'|' -f1)
-            out_conn=$(echo "$parsed_usr" | cut -d'|' -f2)
+        # IP usage display
+        local ip_display="${active_ips}"
+        if [ "$max_ips" != "${E_INF}" ] && [ -n "$max_ips" ]; then
+            ip_display="${active_ips} / ${max_ips}"
+            [ "$active_ips" -ge "$max_ips" ] 2>/dev/null && ip_display="${active_ips} / ${max_ips} ${E_WARN}"
         fi
+
+        local traf=$(fmt_traffic "${octets:-0}")
 
         if [ -z "$link" ]; then
             local e_ip=$(uci -q get telemt.general.external_ip)
@@ -1066,9 +1215,9 @@ handle_command() {
             link="tg://proxy?server=${e_ip}&port=${e_port}&secret=${sec}"
         fi
 
-        local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>Max IPs:</b> ${i}\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${out_txrx}\n${E_PRX} Connections: ${out_conn}\n\n${E_LINK} <code>${link}</code>\n\n<i>Note: Use Apply to activate changes.</i>"
+        local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>IPs:</b> ${ip_display} (max: ${max_ips})\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${traf}\n${E_PRX} Connections: ${conns}\n${E_GLOB} Active IPs: ${active_ips}\n\n${E_LINK} <code>${link}</code>\n\n<i>Use Apply to hot-reload config.</i>"
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply (Restart)\",\"callback_data\":\"cmd_restart_stay_user_${tgt}\"}],[{\"text\":\"${E_BACK} Back to Users\",\"callback_data\":\"cmd_users\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_apply_stay_user_${tgt}\"}],[{\"text\":\"${E_BACK} Back to Users\",\"callback_data\":\"cmd_users\"}]]}"
         send_message "$out" "$kb"
         ;;
 
@@ -1224,12 +1373,14 @@ while true; do
         text=$(echo "$response" | jsonfilter -e "@.result[$i].message.text" 2>/dev/null)
         u_name=$(echo "$response" | jsonfilter -e "@.result[$i].message.from.username" 2>/dev/null)
         callback_id=""
+        CALLBACK_MSG_ID=""
 
         if [ -z "$chat_id" ]; then
             chat_id=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.message.chat.id" 2>/dev/null)
             text=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.data" 2>/dev/null)
             callback_id=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.id" 2>/dev/null)
             u_name=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.from.username" 2>/dev/null)
+            CALLBACK_MSG_ID=$(echo "$response" | jsonfilter -e "@.result[$i].callback_query.message.message_id" 2>/dev/null)
         fi
 
         [ -n "$u_name" ] && u_name="@${u_name}" || u_name="Unknown User"
