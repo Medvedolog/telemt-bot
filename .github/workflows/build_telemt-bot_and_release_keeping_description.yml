@@ -8,7 +8,7 @@
 #   2. Manual dispatch: enter version string (e.g. "3.3.20")
 # ==============================================================================
 
-name: Build and Release telemt-bot
+name: Build and Release telemt-bot with description: 
 
 on:
   push:
