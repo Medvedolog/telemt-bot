@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.30 (adaptive runtime, beobachten, user IPs, self-stealth ready)
+# Version: 3.3.30-2 (adaptive runtime, beobachten, user IPs, self-stealth ready)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -207,7 +207,8 @@ CACHED_METRICS_PORT=$(uci -q get telemt.general.metrics_port)
 CACHED_API_PORT=$(uci -q get telemt.general.api_port)
 [ -z "$CACHED_API_PORT" ] && CACHED_API_PORT="9091"
 
-# ─── 1a. SOCKS discovery (cached) ────────────────────
+# ─── 1a. SOCKS/proxy discovery (cached) ────────────────────
+# Returns primary (first enabled socks) proxy URL
 get_active_socks() {
     local p_url=""
     for up in $(uci show telemt | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
@@ -227,7 +228,29 @@ get_active_socks() {
     echo "$p_url"
 }
 
-update_proxy_cache() { CACHED_PROXY=$(get_active_socks); }
+# Returns space-separated list of ALL enabled SOCKS proxy URLs (for failover)
+get_all_socks() {
+    local all=""
+    for up in $(uci show telemt | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+        local en=$(uci -q get "telemt.${up}.enabled" | tr -d '"')
+        if [ "$en" = "1" ] || [ "$en" = "true" ] || [ "$en" = "on" ] || [ -z "$en" ]; then
+            local type=$(uci -q get "telemt.${up}.type" | tr -d '"')
+            if [ "$type" = "socks5" ] || [ "$type" = "socks4" ]; then
+                local addr=$(uci -q get "telemt.${up}.address" | tr -d '"' | tr -d ' ')
+                if [ -n "$addr" ]; then
+                    local url=""
+                    [ "$type" = "socks5" ] && url="socks5h://${addr}"
+                    [ "$type" = "socks4" ] && url="socks4a://${addr}"
+                    [ -n "$url" ] && all="${all} ${url}"
+                fi
+            fi
+        fi
+    done
+    echo "$all" | sed 's/^ *//'
+}
+
+update_proxy_cache() { CACHED_PROXY=$(get_active_socks); CACHED_ALL_PROXIES=$(get_all_socks); }
+CACHED_ALL_PROXIES=""
 
 # ─── 1b. Tier 1: SOCKS proxy via curl ────────────────
 _try_socks() {
@@ -299,11 +322,27 @@ LAST_ROUTE="none"
 api_request() {
     local method="$1" payload="$2" res=""
 
-    # Tier 1 — SOCKS
+    # Tier 1 — Primary SOCKS
     if res=$(_try_socks "$method" "$payload"); then
         [ "$LAST_ROUTE" != "socks" ] && logger -t telemt-bot "NET: Route -> SOCKS (${CACHED_PROXY})"
         LAST_ROUTE="socks"
         echo "$res"; return 0
+    fi
+
+    # Tier 1.5 — Fallback SOCKS proxies from UCI (skip primary, try the rest)
+    if command -v curl >/dev/null 2>&1 && [ -n "$CACHED_ALL_PROXIES" ]; then
+        for _fb_proxy in $CACHED_ALL_PROXIES; do
+            [ "$_fb_proxy" = "$CACHED_PROXY" ] && continue
+            res=$(curl -sS --max-time 8 \
+                -x "$_fb_proxy" \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "${API_URL}/${method}" 2>/dev/null) && [ -n "$res" ] && {
+                [ "$LAST_ROUTE" != "fallback" ] && logger -t telemt-bot "NET: Route -> FALLBACK (${_fb_proxy})"
+                LAST_ROUTE="fallback"
+                echo "$res"; return 0
+            }
+        done
     fi
 
     # Tier 2 — Direct + system DNS
@@ -332,7 +371,7 @@ api_poll() {
     local poll_max=$((POLL_TIMEOUT + 10))
     local res=""
 
-    # Tier 1 — SOCKS
+    # Tier 1 — Primary SOCKS
     if [ -n "$CACHED_PROXY" ] && command -v curl >/dev/null 2>&1; then
         res=$(curl -s -k \
             --connect-timeout "$poll_connect" \
@@ -340,6 +379,20 @@ api_poll() {
             -x "$CACHED_PROXY" \
             "$url" 2>/dev/null)
         if echo "$res" | grep -q '"ok":true'; then echo "$res"; return 0; fi
+    fi
+
+    # Tier 1.5 — Fallback proxies from UCI
+    if command -v curl >/dev/null 2>&1 && [ -n "$CACHED_ALL_PROXIES" ]; then
+        local _fp
+        for _fp in $CACHED_ALL_PROXIES; do
+            [ "$_fp" = "$CACHED_PROXY" ] && continue
+            res=$(curl -s -k \
+                --connect-timeout "$poll_connect" \
+                --max-time "$poll_max" \
+                -x "$_fp" \
+                "$url" 2>/dev/null)
+            if echo "$res" | grep -q '"ok":true'; then echo "$res"; return 0; fi
+        done
     fi
 
     # Tier 2 — Direct + DNS
