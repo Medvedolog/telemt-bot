@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.30-3 (adaptive runtime, beobachten, user IPs, self-stealth ready)
+# Version: 3.3.30-4 (adaptive runtime, beobachten, user IPs, self-stealth ready)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -567,7 +567,9 @@ _health_write_state() {
 }
 
 _check_proxy_process() {
-    pidof telemt >/dev/null 2>&1 && echo "running" || echo "stopped"
+    # Return "PID" or "stopped" — PID change means restart happened
+    local _hp=$(pidof telemt 2>/dev/null | awk '{print $1}')
+    [ -n "$_hp" ] && echo "$_hp" || echo "stopped"
 }
 
 _check_socks_reachable() {
@@ -598,13 +600,19 @@ health_check_tick() {
     local cur_socks=$(_check_socks_reachable)
 
     # ── Process state change ──
-    if [ "$cur_proc" != "$prev_proc" ] && [ "$prev_proc" != "unknown" ]; then
-        if [ "$cur_proc" = "stopped" ]; then
-            logger -t telemt-bot "HEALTH: Telemt process CRASHED"
+    # cur_proc is PID number or "stopped". Detect: crash, recovery, restart (PID changed).
+    if [ "$prev_proc" != "unknown" ]; then
+        if [ "$cur_proc" = "stopped" ] && [ "$prev_proc" != "stopped" ]; then
+            logger -t telemt-bot "HEALTH: Telemt process CRASHED (was PID ${prev_proc})"
             send_message "${E_ERR} <b>ALERT:</b> Telemt proxy process has stopped!\n\nUse /menu to restart."
-        elif [ "$cur_proc" = "running" ]; then
-            logger -t telemt-bot "HEALTH: Telemt process recovered"
-            send_message "${E_OK} <b>Recovered:</b> Telemt proxy is running again."
+        elif [ "$cur_proc" != "stopped" ] && [ "$prev_proc" = "stopped" ]; then
+            logger -t telemt-bot "HEALTH: Telemt process recovered (PID ${cur_proc})"
+            cache_versions
+            send_message "${E_OK} <b>Recovered:</b> Telemt proxy is running (PID: ${cur_proc}, v${CACHED_CORE_VER})."
+        elif [ "$cur_proc" != "stopped" ] && [ "$prev_proc" != "stopped" ] && [ "$cur_proc" != "$prev_proc" ]; then
+            logger -t telemt-bot "HEALTH: Telemt RESTARTED (PID ${prev_proc} -> ${cur_proc})"
+            cache_versions
+            send_message "${E_RST} <b>Proxy restarted</b> (PID: ${cur_proc}, v${CACHED_CORE_VER})"
         fi
     fi
 
@@ -1066,6 +1074,9 @@ handle_command() {
     "cmd_upstreams"|"/upstreams")
         local up_list="${E_GLOB} <b>Upstream Proxies:</b>\n\n"
         local kb_buttons="" ups_found=0 is_first=1
+        # Fetch live health for icon display
+        local _ap=$(uci -q get telemt.general.api_port || echo "9091")
+        local _up_health=$(api_local "$_ap" "v1/stats/upstreams")
         for up in $(uci show telemt | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
             ups_found=$((ups_found + 1))
             local type=$(uci -q get "telemt.${up}.type" || echo "direct")
@@ -1073,11 +1084,28 @@ handle_command() {
             local alias=$(uci -q get "telemt.${up}.alias" | tr -d '"')
             local weight=$(uci -q get "telemt.${up}.weight" || echo "10")
             local en=$(uci -q get "telemt.${up}.enabled" | awk '{print tolower($1)}'); [ -z "$en" ] && en="1"
-            local icon="${E_OK}"
-            [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ] && icon="${E_FRZ}"
+            # Icon: frozen > unhealthy > healthy
+            local icon="${E_ON}"
+            if [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ]; then
+                icon="${E_FRZ}"
+            elif [ -n "$_up_health" ]; then
+                # Match UCI address to API response and check healthy flag
+                local _hi=0
+                while true; do
+                    local _ha=$(echo "$_up_health" | jsonfilter -e "@.data.upstreams[$_hi].address" 2>/dev/null)
+                    [ -z "$_ha" ] && break
+                    if [ "$_ha" = "$addr" ] || { [ "$type" = "direct" ] && [ "$_ha" = "direct" ]; }; then
+                        local _hh=$(echo "$_up_health" | jsonfilter -e "@.data.upstreams[$_hi].healthy" 2>/dev/null)
+                        [ "$_hh" != "true" ] && icon="${E_ERR}"
+                        break
+                    fi
+                    _hi=$((_hi + 1))
+                done
+            fi
             local label="${type}"
             [ -n "$alias" ] && label="${alias} (${type})"
             [ "$type" = "direct" ] && addr="local"
+            [ "$type" = "shadowsocks" ] && addr=$(uci -q get "telemt.${up}.url" | tr -d '"' | head -c 40)
             up_list="${up_list}${icon} <b>#${ups_found}:</b> ${label}\n<code>${addr}</code> w:${weight}\n\n"
             [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
             local btn_label="${type}"
