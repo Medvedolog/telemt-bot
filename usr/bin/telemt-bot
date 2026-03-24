@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.30-2 (adaptive runtime, beobachten, user IPs, self-stealth ready)
+# Version: 3.3.30-3 (adaptive runtime, beobachten, user IPs, self-stealth ready)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -252,6 +252,21 @@ get_all_socks() {
 update_proxy_cache() { CACHED_PROXY=$(get_active_socks); CACHED_ALL_PROXIES=$(get_all_socks); }
 CACHED_ALL_PROXIES=""
 
+# Resolve proxy URL (socks5h://host:port) to UCI alias or address for logging
+_proxy_name() {
+    local url="$1" addr=""
+    addr=$(echo "$url" | sed 's|socks[45][ha]*://||')
+    for _u in $(uci show telemt 2>/dev/null | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+        local _a=$(uci -q get "telemt.${_u}.address" | tr -d '"')
+        if [ "$_a" = "$addr" ]; then
+            local _al=$(uci -q get "telemt.${_u}.alias" | tr -d '"')
+            [ -n "$_al" ] && echo "$_al" && return
+            echo "$addr" && return
+        fi
+    done
+    echo "$addr"
+}
+
 # ─── 1b. Tier 1: SOCKS proxy via curl ────────────────
 _try_socks() {
     local method="$1" payload="$2"
@@ -324,7 +339,7 @@ api_request() {
 
     # Tier 1 — Primary SOCKS
     if res=$(_try_socks "$method" "$payload"); then
-        [ "$LAST_ROUTE" != "socks" ] && logger -t telemt-bot "NET: Route -> SOCKS (${CACHED_PROXY})"
+        [ "$LAST_ROUTE" != "socks" ] && logger -t telemt-bot "NET: Route -> SOCKS ($(_proxy_name "$CACHED_PROXY"))"
         LAST_ROUTE="socks"
         echo "$res"; return 0
     fi
@@ -338,7 +353,7 @@ api_request() {
                 -H "Content-Type: application/json" \
                 -d "$payload" \
                 "${API_URL}/${method}" 2>/dev/null) && [ -n "$res" ] && {
-                [ "$LAST_ROUTE" != "fallback" ] && logger -t telemt-bot "NET: Route -> FALLBACK (${_fb_proxy})"
+                [ "$LAST_ROUTE" != "fallback" ] && logger -t telemt-bot "NET: Route -> FALLBACK ($(_proxy_name "$_fb_proxy"))"
                 LAST_ROUTE="fallback"
                 echo "$res"; return 0
             }
@@ -847,16 +862,51 @@ handle_command() {
             [ "$uci_mp" = "1" ] && tg_path="ME"
 
             local egress_type="Direct"
-            local up_total=0 up_healthy=0
-            for _u in $(uci show telemt 2>/dev/null | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
-                local _en=$(uci -q get "telemt.${_u}.enabled")
-                [ "$_en" = "0" ] && continue
-                up_total=$((up_total + 1))
-                local _t=$(uci -q get "telemt.${_u}.type")
-                case "$_t" in socks5) egress_type="SOCKS5" ;; socks4) egress_type="SOCKS4" ;; esac
-                up_healthy=$((up_healthy + 1))
-            done
+            local up_total=0 up_healthy=0 up_unhealthy_names=""
+            # Try live health from API first (accurate during degradation)
+            local _a_port=$(uci -q get telemt.general.api_port || echo "9091")
+            local _up_st=$(api_local "$_a_port" "v1/stats/upstreams")
+            if [ -n "$_up_st" ] && echo "$_up_st" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+                local _si=0
+                while true; do
+                    local _sa=$(echo "$_up_st" | jsonfilter -e "@.data.upstreams[$_si].address" 2>/dev/null)
+                    [ -z "$_sa" ] && break
+                    up_total=$((up_total + 1))
+                    local _sh=$(echo "$_up_st" | jsonfilter -e "@.data.upstreams[$_si].healthy" 2>/dev/null)
+                    if [ "$_sh" = "true" ]; then
+                        up_healthy=$((up_healthy + 1))
+                    else
+                        up_unhealthy_names="${up_unhealthy_names} ${_sa}"
+                    fi
+                    _si=$((_si + 1))
+                done
+                # Egress from first upstream type
+                for _u in $(uci show telemt 2>/dev/null | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+                    local _en=$(uci -q get "telemt.${_u}.enabled"); [ "$_en" = "0" ] && continue
+                    local _t=$(uci -q get "telemt.${_u}.type")
+                    case "$_t" in socks5) egress_type="SOCKS5"; break ;; socks4) egress_type="SOCKS4"; break ;; shadowsocks) egress_type="SS"; break ;; esac
+                done
+            else
+                # Fallback: UCI count (no health info)
+                for _u in $(uci show telemt 2>/dev/null | grep '=upstream' | cut -d. -f2 | cut -d= -f1); do
+                    local _en=$(uci -q get "telemt.${_u}.enabled"); [ "$_en" = "0" ] && continue
+                    up_total=$((up_total + 1)); up_healthy=$((up_healthy + 1))
+                    local _t=$(uci -q get "telemt.${_u}.type")
+                    case "$_t" in socks5) egress_type="SOCKS5" ;; socks4) egress_type="SOCKS4" ;; shadowsocks) egress_type="SS" ;; esac
+                done
+            fi
             [ "$up_total" -eq 0 ] && egress_type="Direct"
+
+            # TG Path: prefer runtime initialization API over UCI flag
+            local _init_data=$(api_local "$_a_port" "v1/runtime/initialization")
+            if [ -n "$_init_data" ] && echo "$_init_data" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+                local _tmode=$(echo "$_init_data" | jsonfilter -e "@.data.transport_mode" 2>/dev/null)
+                case "$_tmode" in
+                    direct) tg_path="Direct-DC" ;;
+                    middle) tg_path="ME" ;;
+                    *) ;; # keep UCI value
+                esac
+            fi
 
             # Port status
             local proxy_port=$(uci -q get telemt.general.port || echo "8443")
@@ -869,7 +919,11 @@ handle_command() {
 
             stat_out="\n\n${E_RTR} <b>Router Uptime:</b> ${uptime_sys}\n${E_PRX} <b>Proxy Uptime:</b> ${s_upt}"
             stat_out="${stat_out}\n${E_PATH} <b>TG Path:</b> ${tg_path} | <b>Egress:</b> ${egress_type}"
-            [ "$up_total" -gt 0 ] && stat_out="${stat_out}\n${E_GLOB} <b>Upstream:</b> ${up_healthy}/${up_total} (ok: ${s_upok}, fail: ${s_upfail})"
+            if [ "$up_total" -gt 0 ]; then
+                local _up_icon="${E_ON}"; [ "$up_healthy" -lt "$up_total" ] && _up_icon="${E_WARN}"
+                stat_out="${stat_out}\n${_up_icon} <b>Upstream:</b> ${up_healthy}/${up_total} (ok: ${s_upok}, fail: ${s_upfail})"
+                [ -n "$up_unhealthy_names" ] && stat_out="${stat_out}\n${E_ERR} Down:${up_unhealthy_names}"
+            fi
             stat_out="${stat_out}\n${E_PORT} <b>Port:</b> ${proxy_port} (${port_open})"
             # FakeTLS domain and Self-Stealth status
             local _tls_dom=$(uci -q get telemt.general.domain || echo "?")
@@ -892,13 +946,13 @@ handle_command() {
         [ "$LAST_ROUTE" = "emergency" ] && route_icon="${E_ERR}"
         [ "$LAST_ROUTE" = "none" ] && route_icon="${E_ERR}"
 
-        # Clean bot route display
+        # Clean bot route display with upstream names
         local route_display="DIRECT"
         case "$LAST_ROUTE" in
-            socks) local _px=$(echo "$CACHED_PROXY" | sed 's|socks5h://||;s|socks5://||;s|socks4://||')
-                   route_display="SOCKS5 via ${_px}" ;;
+            socks) route_display="SOCKS via $(_proxy_name "$CACHED_PROXY")" ;;
+            fallback) route_display="FALLBACK via $(_proxy_name "$_fb_proxy")" ;;
             direct) route_display="DIRECT (no SOCKS)" ;;
-            emergency) route_display="EMERGENCY" ;;
+            emergency) route_display="EMERGENCY (hardcoded IP)" ;;
             none) route_display="NOT CONNECTED" ;;
         esac
 
