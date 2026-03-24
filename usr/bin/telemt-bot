@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.30-4 (adaptive runtime, beobachten, user IPs, self-stealth ready)
+# Version: 3.3.30-5 (adaptive runtime, beobachten, user IPs, self-stealth ready)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -632,19 +632,25 @@ health_check_tick() {
 
 start_health_daemon() {
     logger -t telemt-bot "HEALTH: Starting health-check daemon (interval: ${HEALTH_INTERVAL}s)"
-    _health_write_state "unknown" "unknown"
+    # Immediate first tick: establish baseline PID before any sleep
+    local _boot_pid=$(_check_proxy_process)
+    _health_write_state "$_boot_pid" "unknown"
     local tick_count=0
     while true; do
-        sleep "$HEALTH_INTERVAL"
+        # First 5 minutes: check every 15s to catch restarts quickly.
+        # After that: every 60s to save resources.
+        local _hi="$HEALTH_INTERVAL"
+        [ "$tick_count" -lt 20 ] && _hi=15
+        sleep "$_hi"
         update_proxy_cache
         health_check_tick
         tick_count=$((tick_count + 1))
-        # Refresh WAN IP every ~5 minutes (5 ticks × 60s)
-        if [ $((tick_count % 5)) -eq 0 ]; then
+        # Refresh WAN IP every ~5 minutes
+        if [ $((tick_count % 20)) -eq 0 ]; then
             refresh_wan_ip
         fi
-        # Refresh version cache every ~30 minutes (30 ticks)
-        if [ $((tick_count % 30)) -eq 0 ]; then
+        # Refresh version cache every ~30 minutes
+        if [ $((tick_count % 120)) -eq 0 ]; then
             cache_versions
         fi
     done &
