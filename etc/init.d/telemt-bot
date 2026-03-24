@@ -1,11 +1,16 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
-# Telemt-Bot — procd service definition
+# Telemt-Bot — procd service definition v.3.3.30
 # Sidecar Telegram bot for telemt MTProxy management
 #
 # Requires: /etc/config/telemt with [general] section containing
 #   bot_enabled, bot_token, bot_chat_id
 # The postinst script creates a minimal UCI skeleton if missing.
+#
+# NOTE: No procd_add_reload_trigger here — the bot must NOT restart
+# when the main telemt config changes (uci commit telemt). The bot
+# survives proxy restarts and reports them to the admin. Restart the
+# bot manually only when bot_token or bot_chat_id changes.
 # ==============================================================================
 
 START=99
@@ -45,7 +50,6 @@ start_service() {
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 0
     procd_set_param stderr 1
-    procd_set_param file /etc/config/telemt
     procd_close_instance
 
     logger -t telemt-bot "Service started (chat_id=${chat_id})."
@@ -53,9 +57,6 @@ start_service() {
 
 stop_service() {
     logger -t telemt-bot "Service stopping..."
-    # Kill orphaned children (curl, wget, sleep) from long-polling loop.
-    # The bot script runs as /bin/sh, spawning curl/uclient-fetch subprocesses
-    # that survive procd SIGTERM because ash defers signals during child wait.
     local p
     for p in $(pgrep -f "$PROG" 2>/dev/null); do
         kill -TERM "$p" 2>/dev/null
@@ -65,13 +66,4 @@ stop_service() {
         kill -KILL "$p" 2>/dev/null
     done
     rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock
-}
-
-service_triggers() {
-    procd_add_reload_trigger "$CONF"
-}
-
-reload_service() {
-    stop
-    start
 }
