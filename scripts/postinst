@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# telemt-bot — Post-install script
+# telemt-bot — Post-install script v.3.3.30
 # Handles both scenarios:
 #   A) luci-app-telemt already installed -> /etc/config/telemt exists, just enable
 #   B) Headless install (binary only) -> must create UCI skeleton first
