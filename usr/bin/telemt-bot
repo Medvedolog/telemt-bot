@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.22 (fix4: freeze, emoji, buttons-only users, edit-in-place, 4-page runtime)
+# Version: 3.3.30 (adaptive runtime, beobachten, user IPs, self-stealth ready)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -12,7 +12,7 @@
 # ==============================================================================
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="3.3.22"
+BOT_VERSION="3.3.30"
 
 # ──────────────────────────────────────────────
 # 0. UCI Config & Auth
@@ -180,11 +180,18 @@ CACHED_CORE_VER=""
 CACHED_WEB_VER=""
 
 cache_versions() {
-    # init.d writes version to /tmp/etc/telemt.version at startup
-    CACHED_CORE_VER=$(cat /tmp/etc/telemt.version 2>/dev/null)
-    [ -z "$CACHED_CORE_VER" ] && CACHED_CORE_VER=$(cat /tmp/telemt_version 2>/dev/null)
-    [ -z "$CACHED_CORE_VER" ] && CACHED_CORE_VER=$(cat /var/run/telemt_version 2>/dev/null)
-    [ -z "$CACHED_CORE_VER" ] && CACHED_CORE_VER="Unknown"
+    # Prefer live version from Control API (always accurate after binary update)
+    local a_port=$(uci -q get telemt.general.api_port || echo "9091")
+    local api_ver=$(uclient-fetch -q -O - --timeout=1 "http://127.0.0.1:${a_port}/v1/system/info" 2>/dev/null | jsonfilter -e "@.data.version" 2>/dev/null)
+    if [ -n "$api_ver" ]; then
+        CACHED_CORE_VER="$api_ver"
+    else
+        # Fallback: init.d writes version to file at startup
+        CACHED_CORE_VER=$(cat /tmp/etc/telemt.version 2>/dev/null)
+        [ -z "$CACHED_CORE_VER" ] && CACHED_CORE_VER=$(cat /tmp/telemt_version 2>/dev/null)
+        [ -z "$CACHED_CORE_VER" ] && CACHED_CORE_VER=$(cat /var/run/telemt_version 2>/dev/null)
+        [ -z "$CACHED_CORE_VER" ] && CACHED_CORE_VER="Unknown"
+    fi
 
     # WebUI version: read once from opkg/apk database (fast, local file I/O only)
     if [ -z "$CACHED_WEB_VER" ] || [ "$CACHED_WEB_VER" = "N/A" ]; then
@@ -642,6 +649,14 @@ handle_command() {
                         send_message "${E_OK} Upstream address updated! (Press Apply)"
                     else send_message "${E_ERR} Invalid! Use: IP:PORT or hostname:PORT (e.g. 192.168.1.1:1080)."; fi
                     handle_command "up_manage_${tgt}"; return ;;
+                upedit_ss)
+                    # Shadowsocks SIP002 URL: ss://method:key@host:port
+                    local ss_url=$(echo "$cmd" | tr -d ' \r\n\t')
+                    if echo "$ss_url" | grep -qE '^ss://'; then
+                        uci_safe set "telemt.${tgt}.url=${ss_url}"; uci_safe_commit
+                        send_message "${E_OK} Shadowsocks URL set! (Press Apply)"
+                    else send_message "${E_ERR} Invalid! Must start with <code>ss://</code>"; fi
+                    handle_command "up_manage_${tgt}"; return ;;
                 upweight)
                     local w=$(echo "$cmd" | tr -d ' \r\n\t')
                     if echo "$w" | grep -qE '^[0-9]+$' && [ "$w" -gt 0 ] 2>/dev/null && [ "$w" -le 10000 ] 2>/dev/null; then
@@ -673,7 +688,23 @@ handle_command() {
         pidof telemt >/dev/null 2>&1 || _stop_start="{\"text\":\"${E_ON} Start Proxy\",\"callback_data\":\"cmd_start\"}"
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[${_stop_start}]]}"
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-        send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Egress: <b>$(get_egress_type)</b> | TG: <b>$(get_tg_path)</b>\nSelect an action:" "$kb"
+        cache_versions
+        # Quick live stats for menu header
+        local _menu_extra=""
+        local _m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+        local _mp=$(api_local "$_m_port" "metrics" 2>/dev/null)
+        if [ -n "$_mp" ]; then
+            local _mu=$(echo "$_mp" | awk '/^telemt_uptime_seconds /{print $2}')
+            local _md=0 _mh=0 _mm=0
+            [ -n "$_mu" ] && { _md=$(awk "BEGIN{print int($_mu/86400)}"); _mh=$(awk "BEGIN{print int(($_mu%86400)/3600)}"); _mm=$(awk "BEGIN{print int(($_mu%3600)/60)}"); }
+            local _mtx=$(echo "$_mp" | awk '/^telemt_user_octets_to_client/{s+=$2}END{print int(s)}')
+            local _mrx=$(echo "$_mp" | awk '/^telemt_user_octets_from_client/{s+=$2}END{print int(s)}')
+            local _mips=$(echo "$_mp" | awk '/^telemt_user_unique_ips_current\{/{v+=$2}END{print int(v)}')
+            local _mdl=$(fmt_traffic "${_mtx:-0}")
+            local _mul=$(fmt_traffic "${_mrx:-0}")
+            _menu_extra="\n${E_VER} Core: <b>${CACHED_CORE_VER}</b> | Up: ${_md}d ${_mh}h ${_mm}m\n${E_TRAF} DL: ${_mdl} | UL: ${_mul} | IPs: ${_mips:-0}"
+        fi
+        send_message "<b>Telemt Proxy Manager [${host_name}]</b>\nv${BOT_VERSION} | Egress: <b>$(get_egress_type)</b> | TG: <b>$(get_tg_path)</b>${_menu_extra}" "$kb"
         ;;
 
     # ── System status (fast path — uses cached WAN IP and versions) ──
@@ -787,6 +818,14 @@ handle_command() {
             stat_out="${stat_out}\n${E_PATH} <b>TG Path:</b> ${tg_path} | <b>Egress:</b> ${egress_type}"
             [ "$up_total" -gt 0 ] && stat_out="${stat_out}\n${E_GLOB} <b>Upstream:</b> ${up_healthy}/${up_total} (ok: ${s_upok}, fail: ${s_upfail})"
             stat_out="${stat_out}\n${E_PORT} <b>Port:</b> ${proxy_port} (${port_open})"
+            # FakeTLS domain and Self-Stealth status
+            local _tls_dom=$(uci -q get telemt.general.domain || echo "?")
+            local _mask_host=$(uci -q get telemt.general.mask_host)
+            local _mask_port=$(uci -q get telemt.general.mask_port || echo "443")
+            stat_out="${stat_out}\n${E_SHLD} <b>FakeTLS:</b> ${_tls_dom}"
+            if [ -n "$_mask_host" ]; then
+                stat_out="${stat_out}\n${E_SHLD} <b>Self-Stealth:</b> ${_mask_host}:${_mask_port}"
+            fi
             stat_out="${stat_out}\n\n${E_CPU} <b>CPU Load (1/5/15m):</b> ${loadavg}\n${E_RAM} <b>RAM (Free / Telemt):</b> ${free_ram} MB / ${proc_ram} MB"
             stat_out="${stat_out}\n\n${E_TRAF} <b>Total Traffic:</b>\n${E_DWN} DL: ${s_dl_tot} | ${E_UP} UL: ${s_ul_tot}"
             stat_out="${stat_out}\n${E_USR} <b>Users Online:</b> ${s_act} / ${active_u} active"
@@ -954,7 +993,7 @@ handle_command() {
 
     # Upstream creation: step 1 — choose type
     "cmd_up_add")
-        local kb="{\"inline_keyboard\":[[{\"text\":\"SOCKS5\",\"callback_data\":\"up_create_socks5\"},{\"text\":\"SOCKS4\",\"callback_data\":\"up_create_socks4\"},{\"text\":\"Direct\",\"callback_data\":\"up_create_direct\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_upstreams\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"SOCKS5\",\"callback_data\":\"up_create_socks5\"},{\"text\":\"SOCKS4\",\"callback_data\":\"up_create_socks4\"}],[{\"text\":\"Direct\",\"callback_data\":\"up_create_direct\"},{\"text\":\"Shadowsocks\",\"callback_data\":\"up_create_shadowsocks\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_upstreams\"}]]}"
         send_message "${E_ADD} <b>Add Upstream Proxy</b>\n\nChoose proxy type:" "$kb"
         ;;
 
@@ -983,6 +1022,17 @@ handle_command() {
         send_message "${E_EDIT} Created ${stype} upstream.\nEnter proxy address (<code>IP:PORT</code>):"
         ;;
 
+    up_create_shadowsocks)
+        local n="up_$(awk 'BEGIN{srand(); printf "%04x", rand()*65535}')"
+        uci_safe set "telemt.${n}=upstream"
+        uci_safe set "telemt.${n}.type=shadowsocks"
+        uci_safe set "telemt.${n}.weight=10"
+        uci_safe set "telemt.${n}.enabled=0"
+        uci_safe_commit
+        echo "upedit_ss_${n}" > "$STATE_FILE"
+        send_message "${E_EDIT} Created Shadowsocks upstream.\nEnter SIP002 URL:\n<code>ss://method:key@host:port</code>"
+        ;;
+
     up_manage_*)
         local u="${cmd#up_manage_}"
         [ "$(uci -q get "telemt.${u}")" != "upstream" ] && return
@@ -995,8 +1045,39 @@ handle_command() {
         if [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ]; then
             st="${E_FRZ} FROZEN"; t_btn="${E_OK} Enable"; fi
         local name_str=""; [ -n "$al" ] && name_str="\n<b>Name:</b> ${al}"
-        local out="${E_GLOB} <b>Upstream Proxy Settings</b>\n\n<b>Type:</b> ${t}${name_str}\n<b>Address:</b> <code>${a}</code>\n<b>Weight:</b> ${w}\n<b>Status:</b> ${st}\n\n<i>Use Apply to activate changes.</i>"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${E_EDIT} Edit Addr\",\"callback_data\":\"up_edit_${u}\"}],[{\"text\":\"${E_EDIT} Type\",\"callback_data\":\"up_chtype_${u}\"},{\"text\":\"${E_WGT} Weight\",\"callback_data\":\"up_chweight_${u}\"},{\"text\":\"${E_EDIT} Name\",\"callback_data\":\"up_chalias_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_upstreams\"}]]}"
+        # Shadowsocks shows URL instead of address
+        local addr_display="<code>${a}</code>"
+        local edit_addr_label="${E_EDIT} Edit Addr"
+        local edit_addr_cb="up_edit_${u}"
+        if [ "$t" = "shadowsocks" ]; then
+            local ss_url=$(uci -q get "telemt.${u}.url" || echo "not set")
+            addr_display="<code>${ss_url}</code>"
+            edit_addr_label="${E_EDIT} Edit URL"
+            edit_addr_cb="up_edit_ss_${u}"
+        fi
+        # Fetch live health from API (if available)
+        local health_str=""
+        local _ap=$(uci -q get telemt.general.api_port || echo "9091")
+        local _up_api=$(api_local "$_ap" "v1/stats/upstreams")
+        if [ -n "$_up_api" ] && echo "$_up_api" | jsonfilter -e "@.ok" 2>/dev/null | grep -q "true"; then
+            local _ui=0
+            while true; do
+                local _ua=$(echo "$_up_api" | jsonfilter -e "@.data.upstreams[$_ui].address" 2>/dev/null)
+                [ -z "$_ua" ] && break
+                if [ "$_ua" = "$a" ] || [ "$t" = "shadowsocks" ]; then
+                    local _uh=$(echo "$_up_api" | jsonfilter -e "@.data.upstreams[$_ui].healthy" 2>/dev/null)
+                    local _uf=$(echo "$_up_api" | jsonfilter -e "@.data.upstreams[$_ui].fails" 2>/dev/null)
+                    local _ul=$(echo "$_up_api" | jsonfilter -e "@.data.upstreams[$_ui].effective_latency_ms" 2>/dev/null)
+                    local _hi="${E_ON}"; [ "$_uh" != "true" ] && _hi="${E_ERR}"
+                    local _ls="—"; [ -n "$_ul" ] && _ls=$(awk "BEGIN{printf \"%.1f\", $_ul}")
+                    health_str="\n${_hi} fails:${_uf:-0} | lat:${_ls}ms"
+                    break
+                fi
+                _ui=$((_ui + 1))
+            done
+        fi
+        local out="${E_GLOB} <b>Upstream:</b> ${t}${name_str}\n<b>Address:</b> ${addr_display}\n<b>Weight:</b> ${w}\n<b>Status:</b> ${st}${health_str}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${t_btn}\",\"callback_data\":\"up_toggle_${u}\"},{\"text\":\"${edit_addr_label}\",\"callback_data\":\"${edit_addr_cb}\"}],[{\"text\":\"${E_EDIT} Type\",\"callback_data\":\"up_chtype_${u}\"},{\"text\":\"${E_WGT} Weight\",\"callback_data\":\"up_chweight_${u}\"},{\"text\":\"${E_EDIT} Name\",\"callback_data\":\"up_chalias_${u}\"}],[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"up_del_confirm_${u}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_restart_stay_up_${u}\"}],[{\"text\":\"${E_BACK} Upstreams\",\"callback_data\":\"cmd_upstreams\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         send_message "$out" "$kb"
         ;;
 
@@ -1009,6 +1090,12 @@ handle_command() {
         uci_safe_commit; handle_command "up_manage_${u}"
         ;;
 
+    # Shadowsocks URL edit (must be before generic up_edit_*)
+    up_edit_ss_*)
+        echo "upedit_ss_${cmd#up_edit_ss_}" > "$STATE_FILE"
+        send_message "${E_EDIT} Enter Shadowsocks SIP002 URL:\n<code>ss://method:key@host:port</code>"
+        ;;
+
     up_edit_*)
         echo "upedit_${cmd#up_edit_}" > "$STATE_FILE"
         send_message "${E_EDIT} Enter new proxy address (<code>IP:PORT</code>):"
@@ -1016,7 +1103,7 @@ handle_command() {
 
     up_chtype_*)
         local u="${cmd#up_chtype_}"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"SOCKS5\",\"callback_data\":\"up_settype_socks5_${u}\"},{\"text\":\"SOCKS4\",\"callback_data\":\"up_settype_socks4_${u}\"},{\"text\":\"Direct\",\"callback_data\":\"up_settype_direct_${u}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"up_manage_${u}\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"SOCKS5\",\"callback_data\":\"up_settype_socks5_${u}\"},{\"text\":\"SOCKS4\",\"callback_data\":\"up_settype_socks4_${u}\"}],[{\"text\":\"Direct\",\"callback_data\":\"up_settype_direct_${u}\"},{\"text\":\"Shadowsocks\",\"callback_data\":\"up_settype_shadowsocks_${u}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"up_manage_${u}\"}]]}"
         send_message "Select new proxy type:" "$kb"
         ;;
 
@@ -1100,6 +1187,17 @@ handle_command() {
             out="${out}\n\n<b>Upstream Connect</b>"
             out="${out}\nAttempts: ${up_att:-0} | OK: ${up_ok:-0} | Fail: ${up_fail:-0}"
             out="${out}\nSuccess rate: ${rate}"
+            # FakeTLS & Self-Stealth info
+            local _r_dom=$(uci -q get telemt.general.domain || echo "?")
+            local _r_mh=$(uci -q get telemt.general.mask_host)
+            local _r_mp=$(uci -q get telemt.general.mask_port || echo "443")
+            out="${out}\n\n<b>Masking</b>"
+            out="${out}\nFakeTLS: ${_r_dom}"
+            if [ -n "$_r_mh" ]; then
+                out="${out}\nSelf-Stealth: ${E_ON} ${_r_mh}:${_r_mp}"
+            else
+                out="${out}\nSelf-Stealth: off"
+            fi
         else
             out="${out}\n<i>Prometheus unavailable</i>"
         fi
@@ -1412,8 +1510,12 @@ handle_command() {
         rtinfo_send "$out" "$kb"
         ;;
 
-    # ── Stop / Restart ──
+    # ── Stop / Start / Restart — with confirmation ──
     "cmd_stop")
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_WARN} Yes, Stop\",\"callback_data\":\"cmd_stop_confirmed\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"/menu\"}]]}"
+        send_message "${E_STP} <b>Stop proxy?</b> Active connections will be dropped." "$kb"
+        ;;
+    "cmd_stop_confirmed")
         uci_safe set telemt.general.enabled='0'; uci_safe_commit
         /etc/init.d/telemt stop; sleep 1
         logger -t telemt-bot "Proxy stopped by admin"
@@ -1422,17 +1524,24 @@ handle_command() {
         ;;
     "cmd_start")
         uci_safe set telemt.general.enabled='1'; uci_safe_commit
-        /etc/init.d/telemt start; sleep 2
+        /etc/init.d/telemt start; sleep 3
+        cache_versions
         logger -t telemt-bot "Proxy started by admin"
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        send_message "${E_ON} <b>Proxy started</b>" "$kb"
+        send_message "${E_ON} <b>Proxy started</b> (${CACHED_CORE_VER})" "$kb"
         ;;
     "cmd_restart")
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_WARN} Yes, Restart\",\"callback_data\":\"cmd_restart_confirmed\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"/menu\"}]]}"
+        send_message "${E_RST} <b>Restart proxy?</b> Connections will be briefly interrupted." "$kb"
+        ;;
+    "cmd_restart_confirmed")
+        send_message "${E_RST} Restarting proxy..."
         uci_safe set telemt.general.enabled='1'; uci_safe_commit
-        /etc/init.d/telemt restart; sleep 2
+        /etc/init.d/telemt restart; sleep 4
+        cache_versions
         logger -t telemt-bot "Proxy restarted by admin"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
-        send_message "${E_OK} <b>Proxy restarted</b>" "$kb"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        send_message "${E_OK} <b>Proxy restarted</b> (${CACHED_CORE_VER})" "$kb"
         ;;
 
     cmd_restart_stay_mp)
@@ -1540,7 +1649,7 @@ handle_command() {
 
         local out="${E_PRF} <b>User:</b> ${tgt} ${stat_text}\n${E_KEY} <code>${sec}</code>\n\n${E_STAT} <b>Quota:</b> ${q}\n${E_GLOB} <b>IPs:</b> ${ip_display} (max: ${max_ips})\n${E_CAL} <b>Expires:</b> ${e}${warn_txt}\n\n<b>--- Live Stats ---</b>\n${E_TRAF} Traffic: ${traf}\n${E_PRX} Connections: ${conns}\n${E_GLOB} Active IPs: ${active_ips}${ip_line}\n\n${E_LINK} <code>${link}</code>\n\n<i>Use Apply to hot-reload config.</i>"
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_apply_stay_user_${tgt}\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"user_manage_${tgt}\"},{\"text\":\"${E_BACK} Users\",\"callback_data\":\"cmd_users\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Rename\",\"callback_data\":\"user_rename_${tgt}\"},{\"text\":\"${E_RGN} Regen Secret\",\"callback_data\":\"user_regen_${tgt}\"}],[{\"text\":\"${E_STAT} Quota\",\"callback_data\":\"user_set_quota_${tgt}\"},{\"text\":\"${E_GLOB} Max IPs\",\"callback_data\":\"user_set_ips_${tgt}\"}],[{\"text\":\"${E_CAL} Expiry\",\"callback_data\":\"user_set_expiry_${tgt}\"},{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"user_delete_confirm_${tgt}\"}],[{\"text\":\"${fr_t}\",\"callback_data\":\"user_freeze_${tgt}\"},{\"text\":\"${E_RST} Apply\",\"callback_data\":\"cmd_apply_stay_user_${tgt}\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"user_manage_${tgt}\"},{\"text\":\"${E_BACK} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         if [ -n "$CALLBACK_MSG_ID" ]; then
             edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
         else
@@ -1691,12 +1800,28 @@ refresh_wan_ip
 start_health_daemon
 logger -t telemt-bot "Polling: ${LAST_ROUTE} | Health PID: ${HEALTH_PID:-?}"
 
-# Announce startup in chat
+# Announce startup in chat with live stats
 _ts=$(date '+%H:%M')
 _proxy_st="STOPPED"; pidof telemt >/dev/null 2>&1 && _proxy_st="RUNNING"
 _ucnt=$(uci show telemt 2>/dev/null | grep -c '=user')
+_startup_extra=""
+if [ "$_proxy_st" = "RUNNING" ]; then
+    local _m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+    local _sp=$(api_local "$_m_port" "metrics" 2>/dev/null)
+    if [ -n "$_sp" ]; then
+        local _s_upt=$(echo "$_sp" | awk '/^telemt_uptime_seconds /{print $2}')
+        local _s_tx=$(echo "$_sp" | awk '/^telemt_user_octets_to_client/{s+=$2}END{print int(s)}')
+        local _s_rx=$(echo "$_sp" | awk '/^telemt_user_octets_from_client/{s+=$2}END{print int(s)}')
+        local _s_ips=$(echo "$_sp" | awk '/^telemt_user_unique_ips_current\{/{v+=$2}END{print int(v)}')
+        local _s_d=0 _s_h=0 _s_m=0
+        [ -n "$_s_upt" ] && { _s_d=$(awk "BEGIN{print int($_s_upt/86400)}"); _s_h=$(awk "BEGIN{print int(($_s_upt%86400)/3600)}"); _s_m=$(awk "BEGIN{print int(($_s_upt%3600)/60)}"); }
+        local _dl=$(fmt_traffic "${_s_tx:-0}")
+        local _ul=$(fmt_traffic "${_s_rx:-0}")
+        _startup_extra="\n${E_VER} Core: <b>${CACHED_CORE_VER}</b> | Uptime: ${_s_d}d ${_s_h}h ${_s_m}m\n${E_TRAF} DL: ${_dl} | UL: ${_ul} | IPs: ${_s_ips:-0}"
+    fi
+fi
 _kb_start="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Main Menu\",\"callback_data\":\"/menu\"}]]}"
-send_message "${E_PRF} <b>telemt-bot v${BOT_VERSION}</b> started\n${E_SET} ${_ts} | Route: <b>${LAST_ROUTE}</b>\n${E_STAT} Proxy: ${_proxy_st} | Configured users: ${_ucnt}" "$_kb_start"
+send_message "${E_PRF} <b>telemt-bot v${BOT_VERSION}</b> started\n${E_SET} ${_ts} | Route: <b>${LAST_ROUTE}</b>\n${E_STAT} Proxy: ${_proxy_st} | Users: ${_ucnt}${_startup_extra}" "$_kb_start"
 
 while true; do
     response=$(api_poll)
