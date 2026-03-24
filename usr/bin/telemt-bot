@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.30-1 (adaptive runtime, beobachten, user IPs, self-stealth ready)
+# Version: 3.3.30 (adaptive runtime, beobachten, user IPs, self-stealth ready)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -46,7 +46,7 @@ POLL_TIMEOUT=50
 #     Used ONLY when system DNS is poisoned and
 #     SOCKS proxy is down. Last resort.
 # ──────────────────────────────────────────────
-TG_EMERGENCY_IPS="149.154.167.220 149.154.167.198 91.108.4.249"
+TG_EMERGENCY_IPS="149.154.167.220 149.154.166.110 149.154.167.50 91.108.4.249 91.108.8.137 95.161.64.99"
 
 # ──────────────────────────────────────────────
 # 0c. Emoji constants
@@ -1806,17 +1806,17 @@ _proxy_st="STOPPED"; pidof telemt >/dev/null 2>&1 && _proxy_st="RUNNING"
 _ucnt=$(uci show telemt 2>/dev/null | grep -c '=user')
 _startup_extra=""
 if [ "$_proxy_st" = "RUNNING" ]; then
-    local _m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
-    local _sp=$(api_local "$_m_port" "metrics" 2>/dev/null)
+    _m_port=$(uci -q get telemt.general.metrics_port || echo "9092")
+    _sp=$(api_local "$_m_port" "metrics" 2>/dev/null)
     if [ -n "$_sp" ]; then
-        local _s_upt=$(echo "$_sp" | awk '/^telemt_uptime_seconds /{print $2}')
-        local _s_tx=$(echo "$_sp" | awk '/^telemt_user_octets_to_client/{s+=$2}END{print int(s)}')
-        local _s_rx=$(echo "$_sp" | awk '/^telemt_user_octets_from_client/{s+=$2}END{print int(s)}')
-        local _s_ips=$(echo "$_sp" | awk '/^telemt_user_unique_ips_current\{/{v+=$2}END{print int(v)}')
-        local _s_d=0 _s_h=0 _s_m=0
+        _s_upt=$(echo "$_sp" | awk '/^telemt_uptime_seconds /{print $2}')
+        _s_tx=$(echo "$_sp" | awk '/^telemt_user_octets_to_client/{s+=$2}END{print int(s)}')
+        _s_rx=$(echo "$_sp" | awk '/^telemt_user_octets_from_client/{s+=$2}END{print int(s)}')
+        _s_ips=$(echo "$_sp" | awk '/^telemt_user_unique_ips_current\{/{v+=$2}END{print int(v)}')
+        _s_d=0; _s_h=0; _s_m=0
         [ -n "$_s_upt" ] && { _s_d=$(awk "BEGIN{print int($_s_upt/86400)}"); _s_h=$(awk "BEGIN{print int(($_s_upt%86400)/3600)}"); _s_m=$(awk "BEGIN{print int(($_s_upt%3600)/60)}"); }
-        local _dl=$(fmt_traffic "${_s_tx:-0}")
-        local _ul=$(fmt_traffic "${_s_rx:-0}")
+        _dl=$(fmt_traffic "${_s_tx:-0}")
+        _ul=$(fmt_traffic "${_s_rx:-0}")
         _startup_extra="\n${E_VER} Core: <b>${CACHED_CORE_VER}</b> | Uptime: ${_s_d}d ${_s_h}h ${_s_m}m\n${E_TRAF} DL: ${_dl} | UL: ${_ul} | IPs: ${_s_ips:-0}"
     fi
 fi
