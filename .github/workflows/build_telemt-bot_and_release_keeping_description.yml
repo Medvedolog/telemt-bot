@@ -8,7 +8,7 @@
 #   2. Manual dispatch: enter version string (e.g. "3.3.20")
 # ==============================================================================
 
-name: Build and Release telemt-bot2 
+name: Build and Release telemt-bot
 
 on:
   push:
@@ -149,7 +149,7 @@ jobs:
           ## telemt-bot ${{ env.VERSION }}
 
           Autonomous Telegram bot for managing telemt MTProxy on OpenWrt routers.
-          3-tier failover, health-check daemon, UCI-native — works standalone or with luci-app-telemt.
+          4-tier failover, health-check daemon, UCI-native — works standalone or with luci-app-telemt.
 
           ### Installation (opkg)
           ```sh
@@ -171,8 +171,8 @@ jobs:
           ```
 
           ### Dependencies
-          - **Required:** `jsonfilter`, `libustream-*ssl`, `ca-bundle`, `uclient-fetch`
-          - **Recommended:** `curl` (enables SOCKS proxy and Emergency IP failover)
+          - **Required:** `jsonfilter`, `ca-bundle`, `uclient-fetch`
+          - **Recommended:** `curl` (enables SOCKS proxy, Opera proxy and Emergency IP failover)
           EOF
 
           # Шаг 9.2: Проверяем существование релиза и действуем по ситуации
