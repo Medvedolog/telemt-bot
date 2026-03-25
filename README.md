@@ -111,7 +111,7 @@ logread -e 'telemt-bot' | tail -20
 | `uclient-fetch` | **Да** | HTTP-клиент (Резерв Уровня 2) |
 | `curl` | Рекомендуется | Поддержка SOCKS-прокси (Уровень 1) + Резервные IP (Уровень 3) |
 
-> **Внимание, команда CAT:** Без `curl` бот будет использовать только Уровень 2 (прямое соединение через `uclient-fetch`). Маршрутизация через SOCKS-прокси и обход подмены DNS будут недоступны.
+> **Внимание:** Без `curl` бот будет использовать только Уровень 2 (прямое соединение через `uclient-fetch`). Маршрутизация через SOCKS-прокси и обход подмены DNS будут недоступны.
 
 ## 🌐 Резервирование сети (Network Failover)
 
@@ -174,7 +174,7 @@ POSIX-шелл бот в одном файле — 1600 строк чистог�
 | **Резервирование SOCKS**| Дополнительная библиотека | **Флаг curl** |
 | **Роутер 64 МБ RAM** | Нет | **Да** |
 
-### Принципы проектирования (CAT Guidelines)
+### Принципы проектирования (Guidelines)
 1. **Один файл, ноль зависимостей.** Никаких virtualenv или pip. `scp telemt-bot root@router:/usr/bin/` — и готово.
 2. **Нативно для BusyBox.** Используются инструменты из стандартного образа OpenWrt: `awk`, `sed`, `grep`, `jsonfilter`, `uclient-fetch`, `logger`.
 3. **Строгий POSIX.** Никаких "башизмов" (без `[[ ]]`, `(( ))`, массивов). Работает на `ash`, `dash` и любом POSIX `sh`.
@@ -189,7 +189,7 @@ POSIX-шелл бот в одном файле — 1600 строк чистог�
 
 It operates as a sidecar service to `luci-app-telemt`, seamlessly integrating with OpenWrt's native UCI system (`/etc/config/telemt`) and `procd` init supervisor. 
 
-**Key highlights for Team CAT:**
+**Key highlights:**
 * **Fully featured UI in Telegram:** Manage users, toggle SOCKS upstreams, and view traffic statistics via inline buttons.
 * **Resilient Connectivity:** Features a robust 3-tier network failover ensuring the bot stays online.
 * **Universal Compatibility:** As a simple shell script, it runs on any architecture (MIPS, ARM, x86) supported by OpenWrt without needing recompilation.
