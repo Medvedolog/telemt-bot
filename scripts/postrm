@@ -1,25 +1,24 @@
 #!/bin/sh
 # ==============================================================================
 # telemt-bot — Post-remove script
-# Cleanup temp files. Disable bot in UCI.
-# SAFETY: Kill any surviving zombie processes (edge case: prerm failed).
-# Does NOT delete /etc/config/telemt or user's bot_token/bot_chat_id.
 # ==============================================================================
 
-# Safety net: kill any surviving processes (prerm may have been skipped)
-for p in $(pgrep -f "/usr/bin/telemt-bot" 2>/dev/null); do
-    kill -KILL "$p" 2>/dev/null
+set +e
+
+# Safety net: kill any surviving processes
+for p in $(pgrep -f "/usr/bin/telemt-bot" 2>/dev/null || true); do
+    kill -KILL "$p" 2>/dev/null || true
 done
 
-# Cleanup runtime temp files
-rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock
+# Cleanup runtime temp files (обновлено под мульти-админку)
+rm -f /tmp/telemt_bot_state_* /tmp/telemt_health_state /tmp/telemt_uci.lock
 rm -f /tmp/telemt_bot_wan_ip /var/run/telemt-bot.pid
 
-# Mark bot as disabled in UCI (safe no-op if config doesn't exist)
+# Mark bot as disabled in UCI
 if uci -q get telemt.general.bot_enabled >/dev/null 2>&1; then
-    uci set telemt.general.bot_enabled='0'
-    uci commit telemt 2>/dev/null
-    logger -t telemt-bot "postrm: bot_enabled set to 0 (package removed)"
+    uci set telemt.general.bot_enabled='0' || true
+    uci commit telemt 2>/dev/null || true
+    logger -t telemt-bot "postrm: bot_enabled set to 0 (package removed)" || true
 fi
 
 exit 0
