@@ -1,31 +1,29 @@
 #!/bin/sh
 # ==============================================================================
 # telemt-bot — Pre-remove script
-# CRITICAL: Must kill bot process with SIGKILL to bypass any buggy trap handlers.
-# Old versions had 'kill 0' in cleanup() that rebooted the router.
-# SIGKILL cannot be trapped, so we bypass the entire cleanup mechanism.
-# Does NOT touch /etc/config/telemt — shared with luci-app-telemt and init.d.
 # ==============================================================================
+
+set +e
 
 PROG="/usr/bin/telemt-bot"
 
-# Step 1: Kill all bot processes with SIGKILL (bypasses trap entirely)
-for p in $(pgrep -f "$PROG" 2>/dev/null); do
-    kill -KILL "$p" 2>/dev/null
+# Step 1: Kill all bot processes
+for p in $(pgrep -f "$PROG" 2>/dev/null || true); do
+    kill -KILL "$p" 2>/dev/null || true
 done
 sleep 1
 
-# Step 2: Kill any surviving children (curl, sleep, health daemon)
-for p in $(pgrep -f "$PROG" 2>/dev/null); do
-    kill -KILL "$p" 2>/dev/null
+# Step 2: Kill any surviving children
+for p in $(pgrep -f "$PROG" 2>/dev/null || true); do
+    kill -KILL "$p" 2>/dev/null || true
 done
 
-# Step 3: Deregister from procd (process already dead, no trap can fire)
-/etc/init.d/telemt-bot disable 2>/dev/null
+# Step 3: Deregister from procd
+/etc/init.d/telemt-bot disable 2>/dev/null || true
 
-# Step 4: Cleanup temp files
-rm -f /tmp/telemt_bot_state /tmp/telemt_health_state /tmp/telemt_uci.lock
+# Step 4: Cleanup temp files (обновлено под новую логику состояний)
+rm -f /tmp/telemt_bot_state_* /tmp/telemt_health_state /tmp/telemt_uci.lock
 rm -f /tmp/telemt_bot_wan_ip /var/run/telemt-bot.pid
 
-logger -t telemt-bot "prerm: Process killed and service disabled."
+logger -t telemt-bot "prerm: Process killed and service disabled." || true
 exit 0
