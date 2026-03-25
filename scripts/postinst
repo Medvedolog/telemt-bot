@@ -1,27 +1,25 @@
 #!/bin/sh
 # ==============================================================================
-# telemt-bot — Post-install script v.3.3.30
-# Handles both scenarios:
-#   A) luci-app-telemt already installed -> /etc/config/telemt exists, just enable
-#   B) Headless install (binary only) -> must create UCI skeleton first
-# SAFETY: Kills any zombie bot processes from previous versions before starting.
+# telemt-bot — Post-install script
 # ==============================================================================
 
-chmod +x /usr/bin/telemt-bot 2>/dev/null
-chmod +x /etc/init.d/telemt-bot 2>/dev/null
+# ОТКЛЮЧАЕМ СТРОГИЙ РЕЖИМ (Критично для apk на OpenWrt 25+)
+set +e
 
-# ─── Kill any zombie bot processes from previous install/upgrade ───
-# Use SIGKILL to bypass any buggy trap handlers in old versions.
-for p in $(pgrep -f "/usr/bin/telemt-bot" 2>/dev/null); do
-    kill -KILL "$p" 2>/dev/null
+chmod +x /usr/bin/telemt-bot 2>/dev/null || true
+chmod +x /etc/init.d/telemt-bot 2>/dev/null || true
+
+# pgrep вернет 1 если пусто. || true спасает скрипт от краша
+for p in $(pgrep -f "/usr/bin/telemt-bot" 2>/dev/null || true); do
+    kill -KILL "$p" 2>/dev/null || true
 done
 sleep 1
 
-# ─── Ensure /etc/config/telemt exists with at least a [general] section ───
+# ─── Ensure /etc/config/telemt exists ───
 UCI_CONF="/etc/config/telemt"
 
 if [ ! -f "$UCI_CONF" ]; then
-    logger -t telemt-bot "postinst: UCI config missing — creating minimal skeleton"
+    logger -t telemt-bot "postinst: UCI config missing — creating minimal skeleton" || true
     cat > "$UCI_CONF" <<'EOF'
 config telemt 'general'
 	option enabled '0'
@@ -37,26 +35,27 @@ config telemt 'network'
 EOF
 fi
 
-# ─── Ensure 'general' section exists (file might exist but be empty/broken) ───
+# ─── Ensure 'general' section exists ───
 if ! uci -q get telemt.general >/dev/null 2>&1; then
-    logger -t telemt-bot "postinst: UCI [general] section missing — adding"
-    uci set telemt.general='telemt'
-    uci set telemt.general.enabled='0'
-    uci set telemt.general.bot_enabled='0'
-    uci commit telemt 2>/dev/null
+    logger -t telemt-bot "postinst: UCI [general] section missing — adding" || true
+    uci set telemt.general='telemt' || true
+    uci set telemt.general.enabled='0' || true
+    uci set telemt.general.bot_enabled='0' || true
+    uci commit telemt 2>/dev/null || true
 fi
 
-# ─── Ensure bot_enabled key exists (luci-app-telemt may not have created it) ───
-if [ -z "$(uci -q get telemt.general.bot_enabled)" ]; then
-    uci set telemt.general.bot_enabled='0'
-    uci commit telemt 2>/dev/null
+# ─── Ensure bot_enabled key exists ───
+_bot_en=$(uci -q get telemt.general.bot_enabled 2>/dev/null || echo "")
+if [ -z "$_bot_en" ]; then
+    uci set telemt.general.bot_enabled='0' || true
+    uci commit telemt 2>/dev/null || true
 fi
 
-# ─── Enable procd service (won't start until bot_enabled=1 + token set) ───
-/etc/init.d/telemt-bot enable 2>/dev/null
+# ─── Enable procd service ───
+/etc/init.d/telemt-bot enable 2>/dev/null || true
 
 # ─── Auto-start if already configured ───
-enabled=$(uci -q get telemt.general.bot_enabled)
+enabled=$(uci -q get telemt.general.bot_enabled 2>/dev/null || echo "0")
 if [ "$enabled" = "1" ]; then
     /etc/init.d/telemt-bot start 2>/dev/null &
 fi
