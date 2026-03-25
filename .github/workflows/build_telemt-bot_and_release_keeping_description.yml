@@ -1,6 +1,6 @@
 # ==============================================================================
 # Telemt-Bot — Build & Release Workflow
-# Builds IPK (OpenWrt) and APK (OpenWrt 24+) packages using nFPM.
+# Builds IPK (OpenWrt 21-24 and APK (OpenWrt 25+) packages using nFPM.
 # Pure shell script package (arch: noarch / all).
 #
 # Trigger:
