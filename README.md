@@ -1,80 +1,82 @@
-# telemt-bot
+# 🐾 telemt-bot - люлька-прицеп
 
-Autonomous Telegram bot for managing **telemt MTProxy** on OpenWrt routers.
+Автономный Telegram-бот для управления **telemt MTProxy** на маршрутизаторах OpenWrt.
 
-Works as a **sidecar service** alongside `luci-app-telemt` — shares the same UCI config (`/etc/config/telemt`), does not conflict with the web UI.
+Работает как **sidecar-сервис** (вспомогательная служба) параллельно с `luci-app-telemt` — использует тот же конфигурационный файл UCI (`/etc/config/telemt`) и не конфликтует с веб-интерфейсом.
 
-## Features
+---
 
-- **3-tier network failover:** SOCKS proxy → Direct (system DNS) → Emergency hardcoded IPs
-- **Fast timeouts:** 5s connect / 15s max — no more 10-20s hangs on dead proxies
-- **Health-check daemon:** Auto-notifications on process crash or SOCKS upstream failure
-- **Full user management:** Create, delete, rename, freeze, set quotas/expiry/IP limits
-- **Upstream management:** Add/remove/toggle SOCKS proxies, "Disable All" panic button
-- **Middle Proxy toggle:** Enable/disable ME routing + STUN via inline buttons
-- **UCI-native:** All config stored in `/etc/config/telemt`, compatible with LuCI
-- **procd service:** Managed by OpenWrt's process supervisor with auto-respawn
+## 🚀 Возможности
 
-## Repository Structure
+* **Трехуровневое резервирование сети:** SOCKS-прокси → Прямое соединение (системный DNS) → Резервные зашитые IP-адреса.
+* **Быстрые тайм-ауты:** 5 сек на подключение / 15 сек максимум — больше никаких зависаний на 10-20 секунд из-за мертвых прокси.
+* **Health-check демон:** Автоматические уведомления при падении процесса или сбое SOCKS-апстрима.
+* **Управление пользователями:** Создание, удаление, переименование, заморозка, установка квот/срока действия/лимитов IP-адресов.
+* **Управление апстримами (upstreams):** Добавление/удаление/переключение SOCKS-прокси, тревожная кнопка «Отключить все» (Disable All).
+* **Переключатель Middle Proxy:** Включение/отключение маршрутизации ME + STUN через инлайн-кнопки.
+* **Нативная поддержка UCI:** Вся конфигурация хранится в `/etc/config/telemt`, полностью совместима с LuCI.
+* **Служба procd:** Управляется супервизором процессов OpenWrt с функцией автоматического перезапуска.
 
-```
+## 📂 Структура репозитория
+
+```text
 telemt-bot/
 ├── .github/
 │   └── workflows/
-│       └── release.yml          ← GitHub Actions: build IPK+APK via nFPM
+│       └── release.yml          ← GitHub Actions: сборка IPK+APK через nFPM
 ├── etc/
 │   └── init.d/
-│       └── telemt-bot           ← procd service definition
+│       └── telemt-bot           ← Описание службы procd
 ├── usr/
 │   └── bin/
-│       └── telemt-bot           ← Main bot script (POSIX sh / ash)
+│       └── telemt-bot           ← Основной скрипт бота (POSIX sh / ash)
 ├── scripts/
-│   ├── postinst                 ← Post-install: chmod, enable, auto-start
-│   ├── prerm                    ← Pre-remove: stop & disable service
-│   └── postrm                   ← Post-remove: cleanup temp files
-├── cbi-lua-patch.lua            ← Patch for luci-app-telemt CBI (bot tab UI)
-├── nfpm.yaml                    ← Package build config
+│   ├── postinst                 ← После установки: chmod, включение, автозапуск
+│   ├── prerm                    ← Перед удалением: остановка и отключение службы
+│   └── postrm                   ← После удаления: очистка временных файлов
+├── cbi-lua-patch.lua            ← Патч для CBI luci-app-telemt (вкладка интерфейса бота)
+├── nfpm.yaml                    ← Конфигурация сборки пакета
 └── README.md
 ```
 
-## Installation
+## 🛠 Установка
 
-### From GitHub Release (opkg)
+### Из релизов GitHub (opkg - OpenWrt 21-24)
 
 ```sh
-# Download the latest release
-wget https://github.com/Medvedolog/telemt-bot/releases/latest/download/telemt-bot_3.3.20_all.ipk
+# Скачивание последнего релиза
+wget https://github.com/Medvedolog/telemt-bot/releases/latest/download/telemt-bot_3.3.31_all.ipk
 
-# Install (curl is recommended for SOCKS and Emergency IP support)
+# Установка (рекомендуется установить curl для поддержки SOCKS и резервных IP)
 opkg update
 opkg install curl
-opkg install telemt-bot_3.3.20_all.ipk
+opkg install telemt-bot_3.3.31_all.ipk
 ```
 
-### From GitHub Release (apk — OpenWrt 24+)
+### Из релизов GitHub (apk — OpenWrt 25+)
 
 ```sh
-apk add --allow-untrusted telemt-bot_3.3.20_noarch.apk
+apk add --allow-untrusted telemt-bot_3.3.31_noarch.apk
 ```
 
-### Configuration
+## ⚙️ Конфигурация
 
 ```sh
-# Set your bot credentials (get token from @BotFather, chat ID from @userinfobot)
+# Укажите учетные данные бота (токен получите у @BotFather, chat ID у @userinfobot)
 uci set telemt.general.bot_enabled='1'
 uci set telemt.general.bot_token='123456789:ABCdefGHIjklMNOpqrSTUvwxYZ'
 uci set telemt.general.bot_chat_id='987654321'
 uci commit telemt
 
-# Start the bot
+# Запуск бота
 /etc/init.d/telemt-bot start
 ```
 
-### Headless Install (without luci-app-telemt)
+### Headless Установка (без luci-app-telemt)
 
-The bot reads all settings from UCI (`/etc/config/telemt`). Normally this file is created by `luci-app-telemt`, but if you run a headless setup (telemt binary + bot only), the **postinst script automatically creates a minimal UCI skeleton**:
+Бот считывает все настройки из UCI (`/etc/config/telemt`). Если вы используете систему без GUI, **скрипт postinst автоматически создаст минимальный каркас UCI**:
 
-```
+```text
 config telemt 'general'
     option enabled '0'
     option mode 'tls'
@@ -87,114 +89,108 @@ config telemt 'general'
 config telemt 'network'
 ```
 
-After install, just configure via `uci set` as shown above. If you later install `luci-app-telemt`, it will use the same config file — no conflicts.
+> **Примечание:** Если файл `/etc/config/telemt` уже существует, скрипт postinst не перезапишет его — он лишь убедится, что секция `general` и ключ `bot_enabled` присутствуют.
 
-> **Note:** If `/etc/config/telemt` already exists (from luci-app-telemt or a previous install), the postinst will not overwrite it — only ensures the `general` section and `bot_enabled` key are present.
-
-### Verify
+### Проверка статуса
 
 ```sh
-# Check if running
+# Проверка процесса
 pidof telemt-bot
 
-# View logs
+# Просмотр логов
 logread -e 'telemt-bot' | tail -20
 ```
 
-## Dependencies
+## 📦 Зависимости
 
-| Package | Required | Purpose |
-|---|---|---|
-| `jsonfilter` | **Yes** | Parse Telegram API JSON responses |
-| `libustream-*ssl` | **Yes** | HTTPS support |
-| `ca-bundle` | **Yes** | TLS certificate verification |
-| `uclient-fetch` | **Yes** | HTTP client (Tier 2 fallback) |
-| `curl` | Recommended | SOCKS proxy support (Tier 1) + Emergency IP (Tier 3) |
+| Пакет | Обязателен | Назначение |
+|---|:---:|---|
+| `jsonfilter` | **Да** | Парсинг JSON-ответов от Telegram API |
+| `libustream-*ssl` | **Да** | Поддержка HTTPS |
+| `ca-bundle` | **Да** | Проверка TLS-сертификатов |
+| `uclient-fetch` | **Да** | HTTP-клиент (Резерв Уровня 2) |
+| `curl` | Рекомендуется | Поддержка SOCKS-прокси (Уровень 1) + Резервные IP (Уровень 3) |
 
-> **Without `curl`:** The bot will only use Tier 2 (direct via `uclient-fetch`). SOCKS proxy routing and DNS poisoning bypass are unavailable.
+> **Внимание, команда CAT:** Без `curl` бот будет использовать только Уровень 2 (прямое соединение через `uclient-fetch`). Маршрутизация через SOCKS-прокси и обход подмены DNS будут недоступны.
 
-## Network Failover
+## 🌐 Резервирование сети (Network Failover)
 
-```
-api_request() called
+```text
+Вызов api_request()
   │
-  ├─ Tier 1: curl via SOCKS proxy (socks5h://)
+  ├─ Уровень 1: curl через SOCKS-прокси (socks5h://)
   │    --connect-timeout 5 --max-time 15
-  │    ✓ → done
+  │    ✓ → готово
   │
-  ├─ Tier 2: uclient-fetch direct (system DNS)
+  ├─ Уровень 2: uclient-fetch напрямую (системный DNS)
   │    --timeout 10
-  │    ✓ → done
+  │    ✓ → готово
   │
-  └─ Tier 3: curl --resolve with hardcoded IPs
+  └─ Уровень 3: curl --resolve с жестко заданными IP
        149.154.167.220, 149.154.167.198, 91.108.4.249
-       ✓ → done
-       ✗ → ALL TIERS FAILED (logged)
+       ✓ → готово
+       ✗ → ВСЕ УРОВНИ ЗАВЕРШИЛИСЬ ОШИБКОЙ (запись в лог)
 ```
 
-## Bot Commands (Telegram)
+## 🤖 Команды бота (Telegram)
 
-| Command | Description |
+| Команда | Описание |
 |---|---|
-| `/start`, `/menu` | Main menu with inline keyboard |
-| `/status` | System status, traffic stats, versions |
-| `/users` | User list with management buttons |
-| `/upstreams` | Upstream proxy list |
+| `/start`, `/menu` | Главное меню с инлайн-клавиатурой |
+| `/status` | Состояние системы, статистика трафика, версии |
+| `/users` | Список пользователей с кнопками управления |
+| `/upstreams` | Список апстрим-прокси |
 
-All management is done via inline keyboard buttons — no need to type commands.
+*Всё управление осуществляется через инлайн-кнопки клавиатуры — вводить команды вручную не нужно.*
 
-## UCI Options (shared with luci-app-telemt)
+## 📝 Опции UCI (общие с luci-app-telemt)
 
-| Option | Section | Description |
+| Опция | Секция | Описание |
 |---|---|---|
-| `bot_enabled` | `general` | `0`/`1` — enable bot sidecar |
-| `bot_token` | `general` | Telegram Bot API token |
-| `bot_chat_id` | `general` | Admin Telegram chat ID |
+| `bot_enabled` | `general` | `0`/`1` — включить бота (sidecar) |
+| `bot_token` | `general` | API-токен Telegram-бота |
+| `bot_chat_id` | `general` | ID Telegram-чата администратора |
 
-All other options (users, upstreams, ports, etc.) are read from the same UCI config that LuCI manages.
+Конфигурационный файл UCI `/etc/config/telemt` является **общим** для `luci-app-telemt`, init.d скрипта telemt и `telemt-bot`. Установка/удаление `telemt-bot` никогда не удаляет этот файл.
 
-The UCI config file `/etc/config/telemt` is **shared** between `luci-app-telemt`, the telemt init.d script, and `telemt-bot`. Installing/removing `telemt-bot` never deletes this file.
+## 🔒 Безопасность
 
-## Package Lifecycle Scripts
+* **Только для администратора:** Все команды ограничены настроенным `bot_chat_id`. Попытки несанкционированного доступа логируются как `SECURITY WARNING`.
+* **Локальный доступ к API:** Бот опрашивает telemt исключительно через `127.0.0.1`.
+* **Блокировка UCI:** Все записи в UCI используют `flock` для предотвращения состояния гонки (race conditions) с LuCI.
 
-| Script | What it does |
-|---|---|
-| **postinst** | Creates `/etc/config/telemt` skeleton if missing (headless), ensures `[general]` section and `bot_enabled` key exist, enables procd service, auto-starts if `bot_enabled=1` |
-| **prerm** | Stops bot, disables procd autostart. Does NOT touch UCI config |
-| **postrm** | Cleans temp files (`/tmp/telemt_bot_state`, etc.), sets `bot_enabled=0` in UCI so other init scripts don't try to start a removed binary |
+## 🏗 Архитектура
 
-## Security
+POSIX-шелл бот в одном файле — 1600 строк чистого кода `/bin/sh`, работающего нативно на BusyBox ash в OpenWrt. Полнофункциональный Telegram-бот с инлайн-клавиатурами, обновлением сообщений на месте, трехуровневым резервированием сети и фоновым демоном проверки состояния. 
 
-- **Admin-only:** All commands are restricted to the configured `bot_chat_id`. Unauthorized access attempts are logged as `SECURITY WARNING`.
-- **Local API access:** The bot queries telemt via `127.0.0.1` only.
-- **UCI locking:** All UCI writes use `flock` to prevent race conditions with LuCI.
+### Почему не Python?
 
-<h2>Architecture</h2>
+| Характеристика | Python-бот | telemt-bot (sh) |
+|---|---|---|
+| **Потребление RAM** | 40–80 МБ | **3–5 МБ** |
+| **Зависимости** | python3, pip, venv, requests | **Нет** (Встроены в BusyBox) |
+| **Установка** | pip install + venv + reqs | **Копирование 1 файла** |
+| **Время запуска** | 2–3 секунды (импорты) | **Мгновенно** |
+| **Резервирование SOCKS**| Дополнительная библиотека | **Флаг curl** |
+| **Роутер 64 МБ RAM** | Нет | **Да** |
 
-<p>A single-file POSIX shell bot — 1600 lines of pure <code>/bin/sh</code> running natively on OpenWrt's BusyBox ash. Full-featured Telegram bot with inline keyboards, edit-in-place message updates, multi-page navigation, 3-tier network failover, background health daemon, input validation, and native UCI config integration. Zero external dependencies beyond what ships with every OpenWrt install.</p>
+### Принципы проектирования (CAT Guidelines)
+1. **Один файл, ноль зависимостей.** Никаких virtualenv или pip. `scp telemt-bot root@router:/usr/bin/` — и готово.
+2. **Нативно для BusyBox.** Используются инструменты из стандартного образа OpenWrt: `awk`, `sed`, `grep`, `jsonfilter`, `uclient-fetch`, `logger`.
+3. **Строгий POSIX.** Никаких "башизмов" (без `[[ ]]`, `(( ))`, массивов). Работает на `ash`, `dash` и любом POSIX `sh`.
+4. **UCI — единственный источник истины.** Бот читает и пишет `/etc/config/telemt`. Нет проблем с синхронизацией конфигов.
+5. **Плавная деградация (Graceful degradation).** Резервные пути для каждого вызова API. Работает с telemt от v3.2.x до v3.3.22+.
 
-<h3>Why not Python?</h3>
+---
 
-<table>
-  <tr><th></th><th>Python bot</th><th>telemt-bot (sh)</th></tr>
-  <tr><td><b>RAM usage</b></td><td>40–80 MB</td><td>3–5 MB</td></tr>
-  <tr><td><b>Dependencies</b></td><td>python3, pip, venv, requests, telegram lib</td><td>None (BusyBox built-in)</td></tr>
-  <tr><td><b>Install</b></td><td>pip install + venv + requirements.txt</td><td>Copy 1 file</td></tr>
-  <tr><td><b>Startup time</b></td><td>2–3 seconds (imports)</td><td>Instant</td></tr>
-  <tr><td><b>Crash recovery</b></td><td>systemd / supervisor</td><td>procd native</td></tr>
-  <tr><td><b>Config integration</b></td><td>Custom parser</td><td>UCI native</td></tr>
-  <tr><td><b>SOCKS failover</b></td><td>Extra library</td><td>curl flag</td></tr>
-  <tr><td><b>Runs on 64 MB RAM router</b></td><td>No</td><td>Yes</td></tr>
-  <tr><td><b>Cross-arch</b></td><td>Needs python3 for target arch</td><td>Any arch — it's a shell script</td></tr>
-</table>
+## 🇬🇧 English Summary
 
-<h3>Design Principles</h3>
-<ul>
-  <li><b>Single file, zero dependencies.</b> No virtualenv, no <code>__pycache__</code>, no pip, no version conflicts. <code>scp telemt-bot root@router:/usr/bin/</code> — done.</li>
-  <li><b>BusyBox-native.</b> Uses only tools already present in every OpenWrt image: awk, sed, grep, jsonfilter, uclient-fetch, logger.</li>
-  <li><b>curl is optional.</b> Enables SOCKS5 proxy for Telegram API polling and emergency IP resolution. Without it, the bot falls back to direct <code>uclient-fetch</code> — still fully functional.</li>
-  <li><b>POSIX strict.</b> No bashisms — no <code>[[ ]]</code>, no <code>(( ))</code>, no arrays, no here-strings, no process substitution. Runs on ash, dash, and any POSIX sh.</li>
-  <li><b>UCI is the single source of truth.</b> Bot reads and writes <code>/etc/config/telemt</code> — the same config that LuCI web UI and init.d use. No separate config files, no sync issues.</li>
-  <li><b>Graceful degradation.</b> Every API call has a fallback path. New binary endpoints → old endpoints → Prometheus metrics → cached values. Works with telemt v3.2.x through v3.3.22+.</li>
-  <li><b>Runs anywhere OpenWrt runs.</b> From 64 MB MIPS routers to aarch64 boards to x86 VMs. Same script, no recompilation, no per-arch packages.</li>
-</ul>
+**`telemt-bot`** is a lightweight, zero-dependency, autonomous Telegram bot for managing `telemt MTProxy` directly on OpenWrt routers. Written entirely in POSIX shell (ash), it uses only 3–5 MB of RAM, making it perfectly suited for low-resource devices (even those with 64MB of RAM) where running a standard Python bot is impossible.
+
+It operates as a sidecar service to `luci-app-telemt`, seamlessly integrating with OpenWrt's native UCI system (`/etc/config/telemt`) and `procd` init supervisor. 
+
+**Key highlights for Team CAT:**
+* **Fully featured UI in Telegram:** Manage users, toggle SOCKS upstreams, and view traffic statistics via inline buttons.
+* **Resilient Connectivity:** Features a robust 3-tier network failover ensuring the bot stays online.
+* **Universal Compatibility:** As a simple shell script, it runs on any architecture (MIPS, ARM, x86) supported by OpenWrt without needing recompilation.
+  
