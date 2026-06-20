@@ -63,6 +63,11 @@ E_OS="\ud83d\udc27"; E_NET="\ud83d\udd17"
 E_SCAN="\ud83d\udd0d"; E_PORT="\ud83d\udecf\ufe0f"; E_WGT="\u2696\ufe0f"
 E_OFF="\u26aa"; E_PATH="\ud83d\udee3\ufe0f"; E_EXIT="\ud83d\udeaa"
 E_ON="\ud83d\udfe2"
+E_RUN="\ud83d\udcbb"
+
+SCRIPTS_DIR="/root/.local/telemt-scripts"
+SCRIPTS_LIST_FILE="/tmp/telemt_scripts_list"
+SCRIPT_TIMEOUT=120
 
 # ==============================================================================
 # 1. NETWORK LAYER — 3-TIER FAILOVER
@@ -659,6 +664,84 @@ start_health_daemon() {
 }
 
 # ==============================================================================
+# 4b. User scripts (bash only, from SCRIPTS_DIR)
+# ==============================================================================
+
+scripts_scan() {
+    : > "$SCRIPTS_LIST_FILE"
+    [ -d "$SCRIPTS_DIR" ] || return 1
+    local f base
+    for f in "$SCRIPTS_DIR"/*.sh; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        echo "$base" >> "$SCRIPTS_LIST_FILE"
+    done
+    [ -s "$SCRIPTS_LIST_FILE" ] || return 1
+    sort "$SCRIPTS_LIST_FILE" > "${SCRIPTS_LIST_FILE}.tmp" && mv "${SCRIPTS_LIST_FILE}.tmp" "$SCRIPTS_LIST_FILE"
+    return 0
+}
+
+scripts_get_by_index() {
+    awk -v i="$1" 'NR == i + 1 { print; exit }' "$SCRIPTS_LIST_FILE" 2>/dev/null
+}
+
+scripts_validate_name() {
+    local name="$1"
+    echo "$name" | grep -qE '\.\.|/| ' && return 1
+    echo "$name" | grep -qE '^[a-zA-Z0-9._-]+\.sh$' || return 1
+    [ -f "$SCRIPTS_DIR/$name" ] || return 1
+    return 0
+}
+
+scripts_run() {
+    local name="$1" outfile="$2"
+    local raw="/tmp/telemt_script_raw_$$.txt"
+    local exit_code=0
+
+    if ! command -v bash >/dev/null 2>&1; then
+        echo "bash not found on this system" > "$outfile"
+        return 127
+    fi
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$SCRIPT_TIMEOUT" bash "$SCRIPTS_DIR/$name" >"$raw" 2>&1
+        exit_code=$?
+    else
+        bash "$SCRIPTS_DIR/$name" >"$raw" 2>&1
+        exit_code=$?
+    fi
+
+    {
+        echo "Script: $name"
+        echo "Exit: $exit_code"
+        echo "---"
+        cat "$raw" 2>/dev/null
+    } > "$outfile"
+    rm -f "$raw"
+    return $exit_code
+}
+
+scripts_send_output() {
+    local name="$1" outfile="$2" exit_code="$3"
+    local kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_scripts\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+    local prefix="${E_OK}"
+    [ "$exit_code" -ne 0 ] && prefix="${E_ERR}"
+    [ "$exit_code" -eq 124 ] && prefix="${E_WARN} Timeout"
+
+    local sz
+    sz=$(wc -c < "$outfile" 2>/dev/null | tr -d ' ')
+    if [ "${sz:-0}" -le 3500 ]; then
+        local body
+        body=$(cat "$outfile" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+        send_message "${prefix} <b>${name}</b>\n<pre>${body}</pre>" "$kb"
+    else
+        send_document "$outfile" "${prefix} ${name}"
+        send_message "${prefix} Output attached." "$kb"
+    fi
+    rm -f "$outfile"
+}
+
+# ==============================================================================
 # 5. COMMAND HANDLER (business logic — from v7.4 + improvements)
 # ==============================================================================
 
@@ -668,7 +751,7 @@ handle_command() {
 
     # ── State machine: interactive text input ──
     if [ -f "$STATE_FILE" ]; then
-        if echo "$cmd" | grep -qE '^(cmd_|user_|up_|mp_|/|\[)'; then
+        if echo "$cmd" | grep -qE '^(cmd_|user_|up_|mp_|scr_|/|\[)'; then
             rm -f "$STATE_FILE"
         else
             local state=$(cat "$STATE_FILE"); rm -f "$STATE_FILE"
@@ -768,7 +851,7 @@ handle_command() {
     "/start"|"/menu")
         local _stop_start="{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"}"
         pidof telemt >/dev/null 2>&1 || _stop_start="{\"text\":\"${E_ON} Start Proxy\",\"callback_data\":\"cmd_start\"}"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[${_stop_start}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[{\"text\":\"${E_RUN} Run Script\",\"callback_data\":\"cmd_scripts\"}],[${_stop_start}]]}"
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         cache_versions
         # Quick live stats for menu header
@@ -1276,6 +1359,50 @@ handle_command() {
     up_del_do_*)
         uci_safe delete "telemt.${cmd#up_del_do_}"
         uci_safe_commit; /etc/init.d/telemt restart; handle_command "cmd_upstreams"
+        ;;
+
+    # ── User scripts ──
+    "cmd_scripts")
+        scripts_scan
+        local count=0 kb_buttons="" is_first=1 sname
+        while read -r sname; do
+            [ -z "$sname" ] && continue
+            [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
+            kb_buttons="${kb_buttons}[{\"text\":\"${E_RUN} ${sname}\",\"callback_data\":\"scr_run_${count}\"}]"
+            count=$((count + 1))
+        done < "$SCRIPTS_LIST_FILE"
+
+        local out="${E_RUN} <b>Scripts</b>\nDir: <code>${SCRIPTS_DIR}</code>\nFound: ${count}"
+        [ "$count" -eq 0 ] && out="${E_RUN} <b>Scripts</b>\nDir: <code>${SCRIPTS_DIR}</code>\n\nNo .sh scripts found."
+
+        local kb
+        if [ "$count" -eq 0 ]; then
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_scripts\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        else
+            kb="{\"inline_keyboard\":[${kb_buttons},[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_scripts\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        fi
+
+        if [ -n "$CALLBACK_MSG_ID" ]; then
+            edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
+        else
+            send_message "$out" "$kb"
+        fi
+        ;;
+
+    scr_run_*)
+        local idx="${cmd#scr_run_}"
+        echo "$idx" | grep -qE '^[0-9]+$' || return
+        local sname
+        sname=$(scripts_get_by_index "$idx")
+        [ -z "$sname" ] && { send_message "${E_ERR} Script not found."; return; }
+        scripts_validate_name "$sname" || { send_message "${E_ERR} Invalid script."; return; }
+
+        send_message "${E_RUN} Running <b>${sname}</b>..."
+        local outfile="/tmp/telemt_script_out_$$.txt"
+        scripts_run "$sname" "$outfile"
+        local exit_code=$?
+        logger -t telemt-bot "Script run: ${sname} exit=${exit_code}"
+        scripts_send_output "$sname" "$outfile" "$exit_code"
         ;;
 
     # ── Logs & config ──
