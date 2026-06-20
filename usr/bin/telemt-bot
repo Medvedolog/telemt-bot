@@ -865,7 +865,7 @@ handle_command() {
     "/start"|"/menu")
         local _stop_start="{\"text\":\"${E_STP} Stop Proxy\",\"callback_data\":\"cmd_stop\"}"
         pidof telemt >/dev/null 2>&1 || _stop_start="{\"text\":\"${E_ON} Start Proxy\",\"callback_data\":\"cmd_start\"}"
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[{\"text\":\"${E_RUN} Run Script\",\"callback_data\":\"cmd_scripts\"}],[${_stop_start}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_USR} Users\",\"callback_data\":\"cmd_users\"},{\"text\":\"${E_GLOB} Upstreams\",\"callback_data\":\"cmd_upstreams\"}],[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_SHLD} Middle Proxy\",\"callback_data\":\"cmd_middle_proxy\"}],[{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime_info\"},{\"text\":\"${E_RST} Restart Proxy\",\"callback_data\":\"cmd_restart\"}],[{\"text\":\"${E_RUN} Run Script\",\"callback_data\":\"cmd_scripts\"}],[{\"text\":\"${E_RTR} Reboot Router\",\"callback_data\":\"cmd_reboot\"}],[${_stop_start}]]}"
         local host_name=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         cache_versions
         # Quick live stats for menu header
@@ -1839,6 +1839,16 @@ handle_command() {
         logger -t telemt-bot "Proxy restarted by admin"
         local kb="{\"inline_keyboard\":[[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         send_message "${E_OK} <b>Proxy restarted</b> (${CACHED_CORE_VER})" "$kb"
+        ;;
+
+    "cmd_reboot")
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_WARN} Yes, Reboot\",\"callback_data\":\"cmd_reboot_confirmed\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"/menu\"}]]}"
+        send_message "${E_RTR} <b>Reboot router?</b>\n\nAll services will stop. Device will be offline for 1-3 minutes." "$kb"
+        ;;
+    "cmd_reboot_confirmed")
+        logger -t telemt-bot "Router reboot requested by admin"
+        send_message "${E_RTR} <b>Rebooting router...</b>\n\nDevice will be back online shortly."
+        ( sleep 2; reboot ) >/dev/null 2>&1 &
         ;;
 
     cmd_restart_stay_mp)
