@@ -563,6 +563,16 @@ uci_safe_commit() {
 
 HEALTH_INTERVAL=60
 
+socks_notify_enabled() {
+    local v
+    v=$(uci -q get telemt.general.bot_socks_notify)
+    case "$v" in
+        0|false|off|no) return 1 ;;
+        1|true|on|yes|'') return 0 ;;
+        *) return 0 ;;
+    esac
+}
+
 _health_read_state() {
     cat "$HEALTH_STATE_FILE" 2>/dev/null || echo "unknown|unknown|0"
 }
@@ -625,10 +635,14 @@ health_check_tick() {
     if [ "$cur_socks" != "$prev_socks" ] && [ "$prev_socks" != "unknown" ]; then
         if [ "$cur_socks" = "unreachable" ] && [ "$prev_socks" = "reachable" ]; then
             logger -t telemt-bot "HEALTH: SOCKS upstream DOWN"
-            send_message "${E_WARN} <b>ALERT:</b> SOCKS upstream is unreachable!\nBot switched to: <b>${LAST_ROUTE}</b> route.\n\nProxy: <code>${CACHED_PROXY}</code>"
+            if socks_notify_enabled; then
+                send_message "${E_WARN} <b>ALERT:</b> SOCKS upstream is unreachable!\nBot switched to: <b>${LAST_ROUTE}</b> route.\n\nProxy: <code>${CACHED_PROXY}</code>"
+            fi
         elif [ "$cur_socks" = "reachable" ] && [ "$prev_socks" = "unreachable" ]; then
             logger -t telemt-bot "HEALTH: SOCKS upstream recovered"
-            send_message "${E_OK} <b>Recovered:</b> SOCKS upstream is back online.\nProxy: <code>${CACHED_PROXY}</code>"
+            if socks_notify_enabled; then
+                send_message "${E_OK} <b>Recovered:</b> SOCKS upstream is back online.\nProxy: <code>${CACHED_PROXY}</code>"
+            fi
         fi
     fi
 
@@ -1053,11 +1067,15 @@ handle_command() {
             none) route_display="NOT CONNECTED" ;;
         esac
 
-        local out="${E_STAT} <b>System Status [${host_name}]</b>\n\n${s_icon} <b>Service:</b> ${p_status}\n${E_OS} <b>OS:</b> ${os_ver}\n${E_VER} <b>Core:</b> ${core_ver} | <b>UI:</b> ${web_ver} | <b>Bot:</b> ${BOT_VERSION}\n${E_GLOB} <b>WAN IP:</b> ${wan_ip}\n${route_icon} <b>Bot Route:</b> ${route_display}"
+        local socks_alert_st="${E_OK} ON"
+        local socks_alert_btn="${E_ERR} Disable SOCKS Alerts"
+        socks_notify_enabled || { socks_alert_st="${E_ERR} OFF"; socks_alert_btn="${E_OK} Enable SOCKS Alerts"; }
+
+        local out="${E_STAT} <b>System Status [${host_name}]</b>\n\n${s_icon} <b>Service:</b> ${p_status}\n${E_OS} <b>OS:</b> ${os_ver}\n${E_VER} <b>Core:</b> ${core_ver} | <b>UI:</b> ${web_ver} | <b>Bot:</b> ${BOT_VERSION}\n${E_GLOB} <b>WAN IP:</b> ${wan_ip}\n${route_icon} <b>Bot Route:</b> ${route_display}\n${E_WARN} <b>SOCKS Alerts:</b> ${socks_alert_st}"
         [ -n "$ip_str" ] && out="${out}\n${E_NET} ${ip_str}"
         out="${out}${stat_out}"
 
-        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_FILE} Get TOML\",\"callback_data\":\"cmd_get_toml\"},{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_log\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+        local kb="{\"inline_keyboard\":[[{\"text\":\"${E_FILE} Get TOML\",\"callback_data\":\"cmd_get_toml\"},{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_log\"}],[{\"text\":\"${socks_alert_btn}\",\"callback_data\":\"socks_notify_toggle\"}],[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
         if [ -n "$CALLBACK_MSG_ID" ]; then
             edit_message "$CALLBACK_MSG_ID" "$out" "$kb"
         else
@@ -1083,6 +1101,17 @@ handle_command() {
             uci_safe set telemt.general.use_middle_proxy='1'; uci_safe set telemt.network.stun_tcp_fallback='1'
         fi
         uci_safe_commit; handle_command "cmd_middle_proxy"
+        ;;
+
+    "socks_notify_toggle")
+        if socks_notify_enabled; then
+            uci_safe set telemt.general.bot_socks_notify='0'
+        else
+            uci_safe set telemt.general.bot_socks_notify='1'
+        fi
+        uci_safe_commit
+        logger -t telemt-bot "SOCKS alert notifications toggled: $(uci -q get telemt.general.bot_socks_notify)"
+        handle_command "cmd_status"
         ;;
 
     # ── Users list ──
