@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Telemt Telegram Bot (ash / OpenWrt native)
-# Version: 3.3.30-5 (adaptive runtime, beobachten, user IPs, self-stealth ready)
+# Version: 3.4.0 (adaptive runtime, beobachten, user IPs, self-stealth; html_escape, fallback/active_u fixes)
 # Changelog (since initial shell rewrite):
 #   - 3-tier failover: SOCKS -> Direct+DNS -> Direct+HardcodedIP
 #   - Fast timeouts (--connect-timeout 3 / --max-time 8) for interactive commands
@@ -12,7 +12,7 @@
 # ==============================================================================
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="3.3.30"
+BOT_VERSION="3.4.0"
 
 # ──────────────────────────────────────────────
 # 0. UCI Config & Auth
@@ -141,6 +141,18 @@ fetch_users_live() {
 # Format traffic bytes to human-readable
 fmt_traffic() {
     awk "BEGIN { m=$1/1048576; if(m>1024) printf \"%.1f GB\",m/1024; else printf \"%.0f MB\",m }"
+}
+
+# Escape the 5 HTML special chars for safe interpolation into parse_mode=HTML
+# messages. Use on any UCI/user/Telegram-sourced string shown to the admin
+# (usernames, aliases, addresses) to avoid broken markup or HTML injection.
+html_escape() {
+    printf '%s' "$1" | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&#39;/g"
 }
 
 # Fast localhost API fetch — 1s timeout (localhost responds in <10ms if alive)
@@ -353,15 +365,18 @@ api_request() {
     if command -v curl >/dev/null 2>&1 && [ -n "$CACHED_ALL_PROXIES" ]; then
         for _fb_proxy in $CACHED_ALL_PROXIES; do
             [ "$_fb_proxy" = "$CACHED_PROXY" ] && continue
-            res=$(curl -sS --max-time 8 \
+            res=$(curl -s -k \
+                --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+                --max-time "$CURL_MAX_TIME" \
                 -x "$_fb_proxy" \
                 -H "Content-Type: application/json" \
                 -d "$payload" \
-                "${API_URL}/${method}" 2>/dev/null) && [ -n "$res" ] && {
+                "${API_URL}/${method}" 2>/dev/null)
+            if echo "$res" | grep -q '"ok":true'; then
                 [ "$LAST_ROUTE" != "fallback" ] && logger -t telemt-bot "NET: Route -> FALLBACK ($(_proxy_name "$_fb_proxy"))"
                 LAST_ROUTE="fallback"
                 echo "$res"; return 0
-            }
+            fi
         done
     fi
 
@@ -850,7 +865,7 @@ handle_command() {
                         uci_safe delete "telemt.${tgt}.alias" 2>/dev/null
                         send_message "${E_OK} Name cleared."
                     elif echo "$al" | grep -qE '^[a-zA-Z0-9 _.:-]+$'; then
-                        uci_safe set "telemt.${tgt}.alias=${al}"; send_message "${E_OK} Name: ${al}"
+                        uci_safe set "telemt.${tgt}.alias=${al}"; send_message "${E_OK} Name: $(html_escape "$al")"
                     else
                         send_message "${E_ERR} Invalid name! Use letters, numbers, spaces, dots, dashes."
                     fi
@@ -964,7 +979,13 @@ handle_command() {
             local s_upfail=$(echo "$parsed"|cut -d'|' -f8)
 
             local total_cfg_u=$(uci show telemt | grep -c '=user')
-            local frozen_u=$(uci show telemt | grep '\.enabled=' | grep -x '.*=0' | wc -l)
+            # Count only USER sections that are disabled. The previous version
+            # counted every section with enabled=0 (upstreams, general, ...),
+            # which undercounted active users whenever an upstream was disabled.
+            local frozen_u=0
+            for _cu in $(uci show telemt 2>/dev/null | grep '=user' | cut -d. -f2 | cut -d= -f1); do
+                [ "$(uci -q get "telemt.${_cu}.enabled")" = "0" ] && frozen_u=$((frozen_u + 1))
+            done
             local active_u=$((total_cfg_u - frozen_u))
 
             # Compute TG Path and Egress from UCI
@@ -1221,10 +1242,10 @@ handle_command() {
                 done
             fi
             local label="${type}"
-            [ -n "$alias" ] && label="${alias} (${type})"
+            [ -n "$alias" ] && label="$(html_escape "$alias") (${type})"
             [ "$type" = "direct" ] && addr="local"
             [ "$type" = "shadowsocks" ] && addr=$(uci -q get "telemt.${up}.url" | tr -d '"' | head -c 40)
-            up_list="${up_list}${icon} <b>#${ups_found}:</b> ${label}\n<code>${addr}</code> w:${weight}\n\n"
+            up_list="${up_list}${icon} <b>#${ups_found}:</b> ${label}\n<code>$(html_escape "$addr")</code> w:${weight}\n\n"
             [ "$is_first" = "1" ] && is_first=0 || kb_buttons="${kb_buttons},"
             local btn_label="${type}"
             [ -n "$alias" ] && btn_label="${alias}"
@@ -1297,14 +1318,14 @@ handle_command() {
         local st="${E_OK} ENABLED"; local t_btn="${E_FRZ} Freeze"
         if [ "$en" = "0" ] || [ "$en" = "false" ] || [ "$en" = "off" ]; then
             st="${E_FRZ} FROZEN"; t_btn="${E_OK} Enable"; fi
-        local name_str=""; [ -n "$al" ] && name_str="\n<b>Name:</b> ${al}"
+        local name_str=""; [ -n "$al" ] && name_str="\n<b>Name:</b> $(html_escape "$al")"
         # Shadowsocks shows URL instead of address
-        local addr_display="<code>${a}</code>"
+        local addr_display="<code>$(html_escape "$a")</code>"
         local edit_addr_label="${E_EDIT} Edit Addr"
         local edit_addr_cb="up_edit_${u}"
         if [ "$t" = "shadowsocks" ]; then
             local ss_url=$(uci -q get "telemt.${u}.url" || echo "not set")
-            addr_display="<code>${ss_url}</code>"
+            addr_display="<code>$(html_escape "$ss_url")</code>"
             edit_addr_label="${E_EDIT} Edit URL"
             edit_addr_cb="up_edit_ss_${u}"
         fi
@@ -1536,7 +1557,7 @@ handle_command() {
                 local w=$(echo "$api_up" | jsonfilter -e "@.data.upstreams[$i].weight" 2>/dev/null)
                 local ic="${E_ON}"; [ "$h" != "true" ] && ic="${E_ERR}"
                 local lat_s="—"; [ -n "$lat" ] && lat_s=$(awk "BEGIN{printf \"%.1f\", $lat}")
-                out="${out}\n\n${ic} <b>${kind}://${addr}</b> w:${w:-1}"
+                out="${out}\n\n${ic} <b>${kind}://$(html_escape "$addr")</b> w:${w:-1}"
                 out="${out}\n   fails:${f:-0} | lat:${lat_s}ms"
                 # Per-DC latency for this upstream
                 local d=0
