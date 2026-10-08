@@ -51,6 +51,13 @@ if [ -z "$_bot_en" ]; then
     uci commit telemt 2>/dev/null || true
 fi
 
+# ─── Ensure bot_socks_notify key exists (default: enabled) ───
+_bot_sn=$(uci -q get telemt.general.bot_socks_notify 2>/dev/null || echo "")
+if [ -z "$_bot_sn" ]; then
+    uci set telemt.general.bot_socks_notify='1' || true
+    uci commit telemt 2>/dev/null || true
+fi
+
 # ─── Enable procd service ───
 /etc/init.d/telemt-bot enable 2>/dev/null || true
 
